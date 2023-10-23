@@ -8,7 +8,7 @@ use regex::Regex;
 use std::env;
 use std::error::Error;
 use std::io;
-use std::io::Read; // Needed for Stdin.read_to_string
+use std::io::Read;
 
 /// When there are no errors it reads the standard input, transforms it
 /// and prints the result to the standard output.
@@ -60,7 +60,7 @@ fn read_single_argument() -> Result<String, String> {
 }
 
 /// Read a string from standard input.
-fn read_input() -> io::Result<String> {
+fn read_input() -> Result<String, Box<dyn Error>> {
     let mut text = String::new();
     io::stdin().read_to_string(&mut text)?;
     Ok(text)
