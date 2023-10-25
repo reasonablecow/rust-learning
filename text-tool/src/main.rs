@@ -6,10 +6,10 @@
 //!
 //! Try this out `<example.csv cargo run csv`.
 
+use core::fmt;
 use regex::Regex;
-use std::env;
 use std::error::Error;
-use std::io;
+use std::{env, io};
 
 /// When there are no errors it reads the standard input, transforms it
 /// and prints the result to the standard output.
@@ -30,17 +30,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-type ResultStringOrError = Result<String, Box<dyn Error>>;
+type FnStrToResult = fn(&str) -> Result<String, Box<dyn Error>>;
 
 /// Choose transformation function based on command argument given.
-fn choose_transformation() -> Result<fn(&str) -> ResultStringOrError, String> {
+fn choose_transformation() -> Result<FnStrToResult, String> {
     Ok(match read_single_argument()?.as_str() {
         "lowercase" => |s| Ok(s.to_lowercase()),
         "uppercase" => |s| Ok(s.to_uppercase()),
         "no-spaces" => |s| Ok(s.replace(' ', "")),
         "slugify" => |s| Ok(slug::slugify(s)),
         "one-space" => |s| Ok(Regex::new(r"\s+").map(|p| p.replace_all(s, " ").to_string())?),
-        "csv" => csv,
+        "csv" => |s| Ok(Csv::from_str(s)?.to_string()),
         other => return Err(format!("Argument \"{}\" is not supported!", other)),
     })
 }
@@ -60,45 +60,68 @@ fn read_single_argument() -> Result<String, String> {
     }
 }
 
-/// Returns well formatted table string from parsed CSV.
-///
-/// **Warning!**: Line endings are always LF byte.
-/// TODO: If CRLF is desired use argument end-crlf.
-fn csv(s: &str) -> ResultStringOrError {
-    // Split string into rows and rows into fields.
-    let csv = s
-        .lines()
-        .map(|line| line.split(',').map(|s| s.trim()).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
+/// Structure to hold CSV data.
+struct Csv<'a> {
+    row_length: usize,
+    rows: Vec<Vec<&'a str>>,
+}
 
-    // Check all rows have the same number of fields.
-    let mut row_lengths = csv.iter().map(|h| h.len());
-    let Some(hdr_len) = row_lengths.next() else {
-        return Err("CSV must have an header.".into());
-    };
-    let true = row_lengths.all(|l| l == hdr_len) else {
-        return Err("Every CSV row must have the same number of fields as the header.".into());
-    };
+impl Csv<'_> {
+    /// Parses well-formed CSV from borrowed str.
+    fn from_str(s: &str) -> Result<Csv, Box<dyn Error>> {
+        // Split string into rows and rows into fields.
+        let csv = s
+            .lines()
+            .map(|line| line.split(',').map(|s| s.trim()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
 
-    // Format csv into table string.
-    let Some(widths) = (0..hdr_len)
-        .map(|field_idx| csv.iter().map(|row| row[field_idx].len()).max())
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Err("CSV column width calculation failed, contact the implementer.".into());
-    };
-    Ok(csv
-        .iter()
-        .map(|row| {
-            format!(
-                "|{}|\n",
-                row.iter()
-                    .zip(widths.iter())
-                    .map(|(field, width)| format!(" {:width$} ", field, width = width))
-                    .collect::<Vec<_>>()
-                    .join("|")
-            )
+        // Check all rows have the same number of fields.
+        let mut row_lengths = csv.iter().map(|h| h.len());
+        let Some(hdr_len) = row_lengths.next() else {
+            return Err("CSV must have an header.".into());
+        };
+        let true = row_lengths.all(|l| l == hdr_len) else {
+            return Err("Every CSV row must have the same number of fields as the header.".into());
+        };
+
+        Ok(Csv {
+            row_length: hdr_len,
+            rows: csv,
         })
-        .collect::<Vec<_>>()
-        .concat())
+    }
+}
+
+impl fmt::Display for Csv<'_> {
+    /// Formats Csv as text table.
+    /// **Warning!**: Line endings are always LF byte.
+    /// If CRLF is desired use `s.replace("\n", "\r\n")`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Calculate width for each field.
+        let Some(widths) = (0..self.row_length)
+            .map(|field_idx| self.rows.iter().map(|row| row[field_idx].len()).max())
+            .collect::<Option<Vec<_>>>()
+        else {
+            // CSV calculation of column widths failed, contact the implementer.
+            return Err(fmt::Error);
+        };
+        // Pad fields with spaces, join fields with "|", join lines with "\n".
+        write!(
+            f,
+            "{}",
+            self.rows
+                .iter()
+                .map(|row| {
+                    format!(
+                        "|{}|\n",
+                        row.iter()
+                            .zip(widths.iter())
+                            .map(|(field, width)| format!(" {:width$} ", field, width = width))
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .concat()
+        )
+    }
 }
