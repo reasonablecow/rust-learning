@@ -81,9 +81,11 @@ fn csv(s: &str) -> ResultStringOrError {
     };
 
     // Format csv into table string.
-    // TODO: Change longest to vector of lengths for each column.
-    let Some(longest) = csv.iter().flatten().map(|w| w.len()).max() else {
-        return Err("CSV must have at least one row and one column.".into());
+    let Some(widths) = (0..hdr_len)
+        .map(|field_idx| csv.iter().map(|row| row[field_idx].len()).max())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Err("CSV column width calculation failed, contact the implementer.".into());
     };
     Ok(csv
         .iter()
@@ -91,7 +93,8 @@ fn csv(s: &str) -> ResultStringOrError {
             format!(
                 "|{}|\n",
                 row.iter()
-                    .map(|field| format!(" {:width$} ", field, width = longest))
+                    .zip(widths.iter())
+                    .map(|(field, width)| format!(" {:width$} ", field, width = width))
                     .collect::<Vec<_>>()
                     .join("|")
             )
