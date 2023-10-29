@@ -25,21 +25,33 @@ use std::{env, io};
 /// `stderr().write_fmt(args)` in the end
 /// (see <https://doc.rust-lang.org/src/std/io/stdio.rs.html#1039>).
 fn main() -> Result<(), Box<dyn Error>> {
-    // TODO: match env::args().len() 0 => interactive, 1 => one-shot _ => err
     // TODO: transformation variants change to enum, implement FromStr trait
     // TODO: interactive: spawn threads input-parser and string-transformer
     // TODO: interactive: CSV function change read string from path
-    let transform = choose_transformation()?;
-    let text = io::read_to_string(io::stdin())?;
-    print!("{}", transform(&text)?);
-    Ok(())
+    if let Some(argument) = read_single_argument()? {
+        let transform = parse_transformation(&argument)?;
+        let text = io::read_to_string(io::stdin())?;
+        print!("{}", transform(&text)?);
+        Ok(())
+    } else { // TODO:
+        //spawn_reader
+        //    send
+        //        parse_input
+        //            read_stdin
+        //spawn_writer
+        //    for transform, text in recv
+        //        print
+        //            transform
+        //                text
+        todo!()
+    }
 }
 
 type FnStrToResult = fn(&str) -> Result<String, Box<dyn Error>>;
 
-/// Choose transformation function based on command argument given.
-fn choose_transformation() -> Result<FnStrToResult, String> {
-    Ok(match read_single_argument()?.as_str() {
+/// Returns transformation function based on given argument.
+fn parse_transformation(argument: &str) -> Result<FnStrToResult, String> {
+    Ok(match argument {
         "lowercase" => |s| Ok(s.to_lowercase()),
         "uppercase" => |s| Ok(s.to_uppercase()),
         "no-spaces" => |s| Ok(s.replace(' ', "")),
@@ -50,18 +62,14 @@ fn choose_transformation() -> Result<FnStrToResult, String> {
     })
 }
 
-/// Returns the command line argument if only one given,
-/// otherwise returns an error.
-fn read_single_argument() -> Result<String, String> {
+/// Returns Option of the only command line argument.
+/// Giving more than one argument results in an error.
+fn read_single_argument() -> Result<Option<String>, &'static str> {
     let mut args = env::args().skip(1);
-    if let Some(arg) = args.next() {
-        if args.len() == 0 {
-            Ok(arg)
-        } else {
-            Err(String::from("More than one argument given!"))
-        }
+    if args.len() <= 1 {
+        Ok(args.next())
     } else {
-        Err(String::from("Missing required argument!"))
+        Err("More than one argument given!")
     }
 }
 
