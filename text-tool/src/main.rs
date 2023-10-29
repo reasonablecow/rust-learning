@@ -1,8 +1,9 @@
 //! # Text Transformation Tool
 //!
 //! Implements requirements from
-//! <https://robot-dreams-rust.mag.wiki/2-rust-basics/index.html#homework> and
-//! <https://robot-dreams-rust.mag.wiki/5-error-handling/index.html#homework>.
+//! * <https://robot-dreams-rust.mag.wiki/7-concurrency-multithreading/index.html#homework>
+//! * <https://robot-dreams-rust.mag.wiki/5-error-handling/index.html#homework>
+//! * <https://robot-dreams-rust.mag.wiki/2-rust-basics/index.html#homework>
 //!
 //! Try this out `<example.csv cargo run csv`.
 
@@ -24,6 +25,10 @@ use std::{env, io};
 /// `stderr().write_fmt(args)` in the end
 /// (see <https://doc.rust-lang.org/src/std/io/stdio.rs.html#1039>).
 fn main() -> Result<(), Box<dyn Error>> {
+    // TODO: match env::args().len() 0 => interactive, 1 => one-shot _ => err
+    // TODO: transformation variants change to enum, implement FromStr trait
+    // TODO: interactive: spawn threads input-parser and string-transformer
+    // TODO: interactive: CSV function change read string from path
     let transform = choose_transformation()?;
     let text = io::read_to_string(io::stdin())?;
     print!("{}", transform(&text)?);
