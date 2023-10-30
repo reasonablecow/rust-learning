@@ -1,0 +1,9 @@
+lowercase WRITTEN IN UPPERCASE
+uppercase  written  in  lowercase  separated  by  two  spaces  
+no-spaces          written         with       abundant     spaces
+slugify     czech letters followed ě š č ř ž ý á í é
+one-space       separated  with   more    than     one      space
+csv           example.csv
+
+lowercase
+lowercases
