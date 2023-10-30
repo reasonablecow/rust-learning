@@ -1,7 +1,5 @@
 //! # Text Transformation Tool
 //!
-//! TODO: interactive: CSV function change read string from path
-//!
 //! Implements requirements from
 //! * <https://robot-dreams-rust.mag.wiki/7-concurrency-multithreading/index.html#homework>
 //! * <https://robot-dreams-rust.mag.wiki/5-error-handling/index.html#homework>
@@ -19,7 +17,7 @@ use regex::Regex;
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::mpsc;
-use std::{env, io, thread};
+use std::{env, fs, io, thread};
 
 /// Prints transformed standard input based on its values and arguments given.
 ///
@@ -108,7 +106,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Parses string into transformation function and an argument string
+/// Parses string into Transformation variant and an argument string*
+///
+/// * In Transformation::Csv case the argument is treated as a file name.
 ///
 /// The line parsing should be equivalent to the following regex:
 /// `^\s*(?<transformation>\w+) (?<argument>.*)\n?$`
@@ -122,9 +122,14 @@ fn parse_line(raw: &str) -> Result<(Transformation, String), String> {
         raw
     };
     if let Some((cmd, arg)) = without_newline.trim_start().split_once(' ') {
-        // TODO: if transform == csv -> read from path (arg)
         match cmd.parse::<Transformation>() {
-            Ok(t) => Ok((t, arg.to_string())),
+            Ok(tr) => match tr {
+                Transformation::Csv => match fs::read_to_string(arg.trim()) {
+                    Ok(csv) => Ok((tr, csv)),
+                    Err(e) => Err(format!("{} | {}", e, arg)),
+                },
+                _ => Ok((tr, arg.to_string())),
+            },
             Err(e) => Err(e.to_string()),
         }
     } else {
