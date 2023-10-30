@@ -1,6 +1,5 @@
 //! # Text Transformation Tool
 //!
-//! TODO: transformation variants change to enum, implement FromStr trait
 //! TODO: interactive: CSV function change read string from path
 //!
 //! Implements requirements from
@@ -18,6 +17,7 @@
 use core::fmt;
 use regex::Regex;
 use std::error::Error;
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::{env, io, thread};
 
@@ -52,9 +52,9 @@ use std::{env, io, thread};
 fn main() -> Result<(), Box<dyn Error>> {
     if let Some(argument) = read_single_argument()? {
         // One thread, one transformation, multi-line transformation input
-        let transform = parse_transformation(&argument)?;
+        let t: Transformation = argument.parse()?;
         let text = io::read_to_string(io::stdin())?;
-        print!("{}", transform(&text)?);
+        print!("{}", t.transform(&text)?);
         Ok(())
     } else {
         // Two threads, many transformations, single-line transformation input
@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         state = general_error;
                         eprintln!("{}", msg);
                     }
-                    Ok((transform, text)) => match transform(&text) {
+                    Ok((t, text)) => match t.transform(&text) {
                         Err(msg) => {
                             state = general_error;
                             eprintln!("{}", msg);
@@ -108,14 +108,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-type FnStrToResult = fn(&str) -> Result<String, Box<dyn Error>>;
-
 /// Parses string into transformation function and an argument string
 ///
 /// The line parsing should be equivalent to the following regex:
 /// `^\s*(?<transformation>\w+) (?<argument>.*)\n?$`
 /// (<https://docs.rs/regex/latest/regex/index.html#syntax>).
-fn parse_line(raw: &str) -> Result<(FnStrToResult, String), String> {
+///
+/// _In the future: Return Error object that works with Send._
+fn parse_line(raw: &str) -> Result<(Transformation, String), String> {
     let without_newline = if let Some(stripped) = raw.strip_suffix('\n') {
         stripped
     } else {
@@ -123,7 +123,10 @@ fn parse_line(raw: &str) -> Result<(FnStrToResult, String), String> {
     };
     if let Some((cmd, arg)) = without_newline.trim_start().split_once(' ') {
         // TODO: if transform == csv -> read from path (arg)
-        Ok((parse_transformation(cmd)?, arg.to_string()))
+        match cmd.parse::<Transformation>() {
+            Ok(t) => Ok((t, arg.to_string())),
+            Err(e) => Err(e.to_string()),
+        }
     } else {
         Err(format!(
             "Couldn't parse into `<command> <input>`, data={:?}",
@@ -132,18 +135,65 @@ fn parse_line(raw: &str) -> Result<(FnStrToResult, String), String> {
     }
 }
 
-/// Returns transformation function based on given argument.
-fn parse_transformation(argument: &str) -> Result<FnStrToResult, String> {
-    Ok(match argument {
-        "lowercase" => |s| Ok(s.to_lowercase()),
-        "uppercase" => |s| Ok(s.to_uppercase()),
-        "no-spaces" => |s| Ok(s.replace(' ', "")),
-        "slugify" => |s| Ok(slug::slugify(s)),
-        "one-space" => |s| Ok(Regex::new(r"\s+").map(|p| p.replace_all(s, " ").to_string())?),
-        "csv" => |s| Ok(Csv::from_str(s)?.to_string()),
-        other => return Err(format!("Argument \"{}\" is not supported!", other)),
-    })
+enum Transformation {
+    Lowercase,
+    Uppercase,
+    NoSpaces,
+    Slugify,
+    OneSpace,
+    Csv,
 }
+
+impl Transformation {
+    fn transform(&self, s: &str) -> Result<String, Box<dyn Error>> {
+        match self {
+            Transformation::Lowercase => Ok(s.to_lowercase()),
+            Transformation::Uppercase => Ok(s.to_uppercase()),
+            Transformation::NoSpaces => Ok(s.replace(' ', "")),
+            Transformation::Slugify => Ok(slug::slugify(s)),
+            Transformation::OneSpace => {
+                Ok(Regex::new(r"\s+").map(|p| p.replace_all(s, " ").to_string())?)
+            }
+            Transformation::Csv => Ok(Csv::from_str(s)?.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParseTransformationError(String);
+
+impl fmt::Display for ParseTransformationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Error for ParseTransformationError {}
+
+impl FromStr for Transformation {
+    type Err = ParseTransformationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().replace('-', "").as_str() {
+            "lowercase" => Ok(Transformation::Lowercase),
+            "uppercase" => Ok(Transformation::Uppercase),
+            "nospaces" => Ok(Transformation::NoSpaces),
+            "slugify" => Ok(Transformation::Slugify),
+            "onespace" => Ok(Transformation::OneSpace),
+            "csv" => Ok(Transformation::Csv),
+            _ => Err(ParseTransformationError(format!(
+                "Argument \"{}\" can not be parsed to Transformation!",
+                s
+            ))),
+        }
+    }
+}
+
+// impl From<String> for Transformation {
+//     fn from(s: String) -> Self {
+//         s.as_str().parse()
+//     }
+// }
 
 /// Returns Option of the only command line argument.
 /// Giving more than one argument results in an error.
