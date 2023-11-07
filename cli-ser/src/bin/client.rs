@@ -1,15 +1,8 @@
-use std::{
-    net::TcpStream,
-    error::Error,
-    io::{self, Write, ErrorKind},
-    time::Duration,
-    thread,
-};
+use std::{io, net::TcpStream, thread, time::Duration};
 
-use regex::Regex;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-use cli_ser::{read_msg, write_msg, Message};
+use cli_ser::{get_host_and_port, read_msg, send_msg, Message};
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Image {
@@ -22,13 +15,7 @@ struct File {
     bytes: Vec<u8>,
 }
 
-#[derive(Debug)]
-struct Cmd {
-    cmd: String,
-    arg: String,
-}
-
-fn get_msg() -> Message {
+fn get_msg() -> Option<Message> {
     println!("Please type the commands:");
     let mut buffer = String::new();
     io::stdin().read_line(&mut buffer).expect("tmp");
@@ -38,43 +25,32 @@ fn get_msg() -> Message {
     } else {
         buffer
     };
-    Message::Text(string)
+    Some(Message::Text(string))
 }
 
+fn main() {
+    let address = get_host_and_port();
+    let mut stream =
+        TcpStream::connect(address).expect("Connection to the server should be possible.");
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let (host, port) = ("127.0.0.1", "11111");
-    let mut stream = TcpStream::connect(format!("{host}:{port}"))?;
+    let mut sc = stream
+        .try_clone()
+        .expect("The TcpStream should be cloneable.");
 
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-
-    let mut sc = stream.try_clone()?;
-
-    let handler = thread::spawn(move || {
-        loop {
-            let res = read_msg(&mut sc);
-            match res {
-                Err(err) => {
-                    if let Some(io_error) = err.downcast_ref::<io::Error>() {
-                        if let ErrorKind::UnexpectedEof = io_error.kind() {
-                            println!("unexpected eof {:?}", io_error);
-                            break
-                        }
-                    }
-                }
-                Ok(s) => println!("{:?}", s),
-            }
+    let handler = thread::spawn(move || loop {
+        if let Some(msg) = read_msg(&mut sc) {
+            println!("{:?}", msg);
         }
+        thread::sleep(Duration::from_secs(5));
     });
 
-
-    loop {
+    while let Some(msg) = dbg!(get_msg()) {
         // let cmd = Cmd::from_stdin()?;
         // let msg = Message::from_cmd(cmd)?;
         // let msg = Message::Text(String::from("hello world"));
-        write_msg(&mut stream, dbg!(get_msg()))?;
+        send_msg(&mut stream, msg);
     }
 
     let res = handler.join();
-    Ok(())
+    println!("{:?}", res);
 }

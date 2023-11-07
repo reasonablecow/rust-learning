@@ -1,60 +1,84 @@
 use std::{
-    net::{TcpListener,SocketAddr, TcpStream},
-    error::Error,
-    io::{Read,Write,ErrorKind, Error as IoError},
     collections::HashMap,
+    io::Write,
+    net::{SocketAddr, TcpListener, TcpStream},
+    sync::mpsc,
     thread,
 };
 
-use cli_ser::{Message, read_msg, write_msg};
+use crate::Task::*;
+use cli_ser::{get_host_and_port, read_msg, Message};
 
-// Server is reading and writing in a blocking fashion.
-// let Some() = res.err().map(|x| x.kind())
-fn main() -> Result<(), Box<dyn Error>> {
-    println!("i am the server!");
-    let (host, port) = ("127.0.0.1", "11111");
+const MSCP_ERROR: &str = "Sending message over the mpsc channel should always work.";
 
-    let listener = TcpListener::bind(format!("{host}:{port}"))?;
-
-    let mut clients: HashMap<SocketAddr, TcpStream> = HashMap::new();
-
-    for incoming in listener.incoming() {
-        let mut stream = incoming?;
-        let addr = stream.peer_addr()
-            .expect("Address of the TcpStream other end should be readable");
-        clients.insert(addr.clone(), stream);
-
-        let mut stream_clone = clients.get(&addr).unwrap().try_clone().unwrap();
-
-        let handler = thread::spawn(move || {
-            handle_connection(stream_clone);
-        });
-    }
-    Ok(())
+#[derive(Debug)]
+enum Task {
+    NewStream(TcpStream),
+    Check(SocketAddr),
+    Broadcast(SocketAddr, Message),
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    loop {
-        let res = dbg!(read_msg(&mut stream));
+fn main() {
+    println!("i am the server!");
+    let address = get_host_and_port();
 
-        match res {
-            Ok(msg) => {
-                println!("broadcasting..."); 
-                write_msg(&mut stream, msg).unwrap();
+    let (sender, receiver) = mpsc::channel();
+
+    let listener = TcpListener::bind(address).expect("TCP listener creation should not fail.");
+
+    let sender_clone = sender.clone();
+    let _stream_receiver = thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let /*mut*/ stream = incoming.expect("Incoming Stream should be Ok");
+            println!("incoming {:?}", stream);
+            sender_clone.send(NewStream(stream)).expect(MSCP_ERROR);
+        }
+    });
+
+    let mut streams: HashMap<SocketAddr, TcpStream> = HashMap::new();
+    for task in receiver {
+        match task {
+            NewStream(stream) => {
+                let addr = stream
+                    .peer_addr()
+                    .expect("Every stream should have accessible address.");
+                streams.insert(addr /*.clone()*/, stream);
+                println!("streams {:?}", streams);
+                sender.send(Check(addr)).expect(MSCP_ERROR);
             }
-            Err(err) => {
-                if let Some(io_error) = err.downcast_ref::<IoError>() {
-                    match io_error.kind() {
-                        ErrorKind::UnexpectedEof => {
-                            println!("unexpected eof {:?}", io_error);
-                            break // lets go somewhere else
-                        }
-                        _ => {
-                            println!("Other IO error: {:?}", io_error);
-                        }
+            Check(addr) => {
+                let /*mut*/ stream = streams
+                    .get(&addr)
+                    .expect("All addresses are added before checked.");
+
+                let sender_clone = sender.clone();
+                let mut stream_clone = stream.try_clone().expect("Stream should be cloneable.");
+
+                let _check_thread = thread::spawn(move || {
+                    if let Some(msg) = read_msg(&mut stream_clone) {
+                        sender_clone.send(Broadcast(addr, msg)).expect(MSCP_ERROR);
                     }
-                } else {
-                    println!("Non-IO error: {:?}", err);
+                    sender_clone.send(Check(addr)).expect(MSCP_ERROR);
+                });
+            }
+            Broadcast(addr, msg) => {
+                println!("{:?} {:?}", addr, msg);
+                for (other_addr, mut stream) in &streams {
+                    if addr != *other_addr {
+                        println!("differ {:?} {:?}", addr, other_addr);
+
+                        let bytes = bincode::serialize(&msg)
+                            .expect("Message serialization should work fine.");
+                        let len = bytes.len() as u32;
+
+                        stream
+                            .write_all(&len.to_be_bytes())
+                            .expect("Writing to stream should work flawlessly.");
+                        stream
+                            .write_all(&bytes)
+                            .expect("Writing the serialized message should be ok.");
+                        stream.flush().expect("flushing the stream should be ok");
+                    }
                 }
             }
         }
