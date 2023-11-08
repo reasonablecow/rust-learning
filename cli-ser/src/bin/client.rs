@@ -2,7 +2,7 @@ use std::{io, net::TcpStream, thread, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
-use cli_ser::{get_host_and_port, read_msg, send_msg, Message};
+use cli_ser::{get_host_and_port, read_msg, send_bytes, serialize_msg, Message};
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Image {
@@ -48,7 +48,8 @@ fn main() {
         // let cmd = Cmd::from_stdin()?;
         // let msg = Message::from_cmd(cmd)?;
         // let msg = Message::Text(String::from("hello world"));
-        send_msg(&mut stream, msg);
+        send_bytes(&mut stream, &serialize_msg(&msg))
+            .expect("Sending of you message failed, please restart and try again.");
     }
 
     let res = handler.join();

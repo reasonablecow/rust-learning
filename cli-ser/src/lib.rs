@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::TcpStream,
     thread,
     time::Duration,
@@ -102,17 +102,19 @@ pub fn read_msg(stream: &mut TcpStream) -> Option<Message> {
     }
 }
 
-pub fn send_msg(stream: &mut TcpStream, msg: Message) {
-    let bytes = bincode::serialize(&msg).expect("Message serialization should work fine.");
-    let len = bytes.len() as u32;
+/// Serializes Message into bytes.
+///
+/// !Panics if serialization fails (should never happen).
+pub fn serialize_msg(msg: &Message) -> Vec<u8> {
+    bincode::serialize(msg)
+        .expect("Message serialization should always work - contact the implementer!")
+}
 
-    stream
-        .write_all(&len.to_be_bytes())
-        .expect("Writing to stream should work flawlessly.");
-    stream
-        .write_all(&bytes)
-        .expect("Writing the serialized message should be ok.");
-    stream.flush().expect("flushing the stream should be ok");
+pub fn send_bytes(stream: &mut TcpStream, bytes: &Vec<u8>) -> Result<(), io::Error> {
+    stream.write_all(&((bytes.len() as u32).to_be_bytes()))?;
+    stream.write_all(bytes)?;
+    stream.flush()?;
+    Ok(())
 }
 
 pub fn simulate_connections() {
@@ -123,8 +125,8 @@ pub fn simulate_connections() {
         for sth in ["one", "two", "three", "four", "five"] {
             let mut stream = TcpStream::connect(address.clone())
                 .expect("TCP stream connection from another thread should be possible.");
-            let msg = Message::Text(sth.to_string());
-            send_msg(&mut stream, msg);
+            let bytes = serialize_msg(&Message::Text(sth.to_string()));
+            send_bytes(&mut stream, &bytes).expect("sending bytes to the server should work");
             streams.push(stream);
         }
         streams
