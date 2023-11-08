@@ -1,32 +1,8 @@
-use std::{io, net::TcpStream, thread, time::Duration};
+use std::{fs, io::Write, net::TcpStream, thread, time::Duration};
 
-use serde::{Deserialize, Serialize};
+use cli_ser::{get_host_and_port, read_msg, send_bytes, serialize_msg, Command, Message};
 
-use cli_ser::{get_host_and_port, read_msg, send_bytes, serialize_msg, Message};
-
-#[derive(Serialize, Deserialize, Debug)]
-enum Image {
-    Png(Vec<u8>),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct File {
-    filename: String,
-    bytes: Vec<u8>,
-}
-
-fn get_msg() -> Option<Message> {
-    println!("Please type the commands:");
-    let mut buffer = String::new();
-    io::stdin().read_line(&mut buffer).expect("tmp");
-
-    let string = if let Some(stripped) = buffer.strip_suffix('\n') {
-        stripped.to_string()
-    } else {
-        buffer
-    };
-    Some(Message::Text(string))
-}
+const FILES_DIR: &str = "files";
 
 fn main() {
     let address = get_host_and_port();
@@ -37,21 +13,33 @@ fn main() {
         .try_clone()
         .expect("The TcpStream should be cloneable.");
 
-    let handler = thread::spawn(move || loop {
+    let _receiver = thread::spawn(move || loop {
         if let Some(msg) = read_msg(&mut sc) {
-            println!("{:?}", msg);
+            match msg {
+                Message::File(f) => {
+                    println!("Received {}", f.name);
+                    fs::create_dir_all(FILES_DIR)
+                        .expect("Directory for files couldn't be created.");
+                    let mut file = fs::File::create(format!("{}/{}", FILES_DIR, f.name)) // TODO use path utilities instead of unix conventions.
+                        .expect("File creation failed.");
+                    file.write_all(&f.bytes).expect("Writing the file failed.");
+                }
+                Message::Text(text) => println!("{}", text),
+            }
         }
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(100));
     });
 
-    while let Some(msg) = dbg!(get_msg()) {
-        // let cmd = Cmd::from_stdin()?;
-        // let msg = Message::from_cmd(cmd)?;
-        // let msg = Message::Text(String::from("hello world"));
+    loop {
+        let msg = match Command::from_stdin() {
+            Command::Quit => {
+                println!("Goodbye!");
+                break;
+            }
+            cmd => Message::from_cmd(cmd).expect("User provided wrong command."),
+        };
+        println!("sending {:?}", msg);
         send_bytes(&mut stream, &serialize_msg(&msg))
             .expect("Sending of you message failed, please restart and try again.");
     }
-
-    let res = handler.join();
-    println!("{:?}", res);
 }

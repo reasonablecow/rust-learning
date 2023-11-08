@@ -44,7 +44,6 @@ fn main() {
                     .peer_addr()
                     .expect("Every stream should have accessible address.");
                 streams.insert(addr, stream);
-                println!("streams {:?}", streams);
                 sender.send(Check(addr)).expect(MSCP_ERROR);
             }
             Check(addr) => {
@@ -61,7 +60,7 @@ fn main() {
                 } // The stream was removed from streams after the Check creation.
             }
             Broadcast(addr_from, msg) => {
-                println!("{:?} {:?}", addr_from, msg);
+                println!("broadcasting from {:?} message {:?}", addr_from, msg);
                 let bytes = serialize_msg(&msg);
 
                 for (&addr_to, stream) in &streams {
