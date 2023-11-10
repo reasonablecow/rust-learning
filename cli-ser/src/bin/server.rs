@@ -60,7 +60,7 @@ fn main() {
                 } // The stream was removed from streams after the Check creation.
             }
             Broadcast(addr_from, msg) => {
-                println!("broadcasting from {:?} message {:?}", addr_from, msg);
+                println!("broadcasting message from {:?}", addr_from);
                 let bytes = serialize_msg(&msg);
 
                 for (&addr_to, stream) in &streams {
@@ -83,6 +83,7 @@ fn main() {
                 }
             }
             StreamClose(addr) => {
+                println!("disconnected {}", addr);
                 streams
                     .remove(&addr)
                     .expect("Stream was present and should have been so until now.");
