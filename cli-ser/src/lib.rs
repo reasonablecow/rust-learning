@@ -1,7 +1,7 @@
-//! Client Server Utilities
+//! Client-Server Utilities
 //!
 //! ## Examples
-//! *
+//! * https://rustacean.net/assets/rustacean-orig-noshadow.png
 //! * https://github.com/rust-community/resources/blob/gh-pages/sticker/rust/examples/hexagon.jpeg
 
 use std::{
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 pub enum ImageFormat {
     Png,
     Jpeg,
-    //...todo
+    //... I hope there is a better way to solve this but otherwise here would go the duplicates.
 }
 impl ImageFormat {
     fn to_str(self) -> &'static str {
@@ -85,13 +85,14 @@ impl Image {
     }
 }
 
-// TODO private fields
 #[derive(Serialize, Deserialize, Debug)]
 pub struct File {
+    // the fields could be private with getters as well
     pub name: PathBuf,
     pub bytes: Vec<u8>,
 }
 
+/// Messages to be sent over the network.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Message {
     Text(String),
@@ -99,7 +100,6 @@ pub enum Message {
     Image(Image),
 }
 
-/// TODO
 impl Message {
     pub fn from_cmd(cmd: Command) -> Result<Message, Box<dyn Error>> {
         match cmd {
@@ -141,6 +141,7 @@ impl Message {
     }
 }
 
+/// Commands useful for the client user.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum Command {
     Quit,
@@ -184,7 +185,7 @@ impl Command {
 
 /// Tries to read a message in a nonblocking fashion.
 ///
-/// Panics for other io::Error kinds than WouldBlock.
+/// Panics for other io::Errors than empty or closed streams.
 pub fn read_msg(stream: &mut TcpStream) -> Option<Message> {
     stream
         .set_nonblocking(true)
@@ -215,13 +216,15 @@ pub fn read_msg(stream: &mut TcpStream) -> Option<Message> {
 
 /// Serializes Message into bytes.
 ///
-/// !Panics if serialization fails (should never happen).
+/// Panics when serialization fails (should never happen).
 pub fn serialize_msg(msg: &Message) -> Vec<u8> {
     bincode::serialize(msg)
         .expect("Message serialization should always work - contact the implementer!")
 }
 
-/// BrokenPipe error kind occurs when sending a message to a closed stream.
+/// Sends bytes over given stream.
+///
+/// Panics! BrokenPipe error kind occurs when sending a message to a closed stream.
 pub fn send_bytes(stream: &mut TcpStream, bytes: &Vec<u8>) -> Result<(), io::Error> {
     stream.write_all(&((bytes.len() as u32).to_be_bytes()))?;
     stream.write_all(bytes)?;
@@ -229,7 +232,8 @@ pub fn send_bytes(stream: &mut TcpStream, bytes: &Vec<u8>) -> Result<(), io::Err
     Ok(())
 }
 
-pub fn simulate_connections() {
+/// DON'T USE! However it was useful for testing.
+pub fn _simulate_connections() {
     let connection_simulator = thread::spawn(move || {
         let mut streams = Vec::new();
         for sth in ["one", "two", "three", "four", "five"] {

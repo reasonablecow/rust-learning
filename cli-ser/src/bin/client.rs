@@ -26,6 +26,10 @@ struct Args {
     save_png: bool,
 }
 
+/// Client's main function.
+///
+/// The main thread in a loop executes commands given by the user.
+/// Another thread is spawned in the background to receive messages from the server.
 fn main() {
     let files_dir = Path::new("files");
     let images_dir = Path::new("images");
@@ -43,8 +47,9 @@ fn main() {
         .expect("The TcpStream should be cloneable.");
 
     // Channel to indicate to stop waiting for messages.
-    let (sender, receiver) = mpsc::channel::<bool>();
+    let (end_sender, end_receiver) = mpsc::channel();
 
+    // Reads messages from the server in the background.
     let receiver = thread::spawn(move || loop {
         if let Some(msg) = read_msg(&mut stream_clone) {
             match msg {
@@ -66,18 +71,21 @@ fn main() {
                     println!("Received image...");
                 }
             }
-        } else if receiver.try_recv().is_ok() {
+        } else if end_receiver.try_recv().is_ok() {
             break;
         }
     });
 
+    // Parses and executes commands given by the user.
     loop {
         let msg = match Command::from_stdin() {
             Command::Quit => {
                 println!("Goodbye!");
                 // Time for messages which were sent but were not receivable yet.
                 thread::sleep(Duration::from_secs(5));
-                sender.send(true).expect("Program crashed during closing.");
+                end_sender
+                    .send(true)
+                    .expect("Program crashed during closing.");
                 break;
             }
             cmd => Message::from_cmd(cmd).expect("User provided wrong command."),
@@ -86,6 +94,7 @@ fn main() {
             .expect("Sending of you message failed, please restart and try again.");
     }
 
+    // Wait for the receiver to finish its job.
     receiver
         .join()
         .expect("Message receiver crashed, sorry for the inconvenience.");

@@ -26,6 +26,7 @@ struct Args {
     port: u32,
 }
 
+/// Server tasks which are queued and addressed.
 #[derive(Debug)]
 enum Task {
     NewStream(TcpStream),
@@ -34,6 +35,12 @@ enum Task {
     StreamClose(SocketAddr),
 }
 
+/// Server's main function consisting of a "welcoming" thread and server's main loop.
+///
+/// The server listens at specified address (host and port).
+/// One separate "welcoming" thread is dedicated to capture new clients.
+/// In the main loop the server takes one task at a time from a queue.
+/// Small tasks solves by itself and for more complicated once spawns a new thread.
 fn main() {
     let args = Args::parse();
 
