@@ -182,11 +182,6 @@ impl Command {
     }
 }
 
-/// TODO
-pub fn get_host_and_port() -> String {
-    String::from("127.0.0.1:11111")
-}
-
 /// Tries to read a message in a nonblocking fashion.
 ///
 /// Panics for other io::Error kinds than WouldBlock.
@@ -235,12 +230,10 @@ pub fn send_bytes(stream: &mut TcpStream, bytes: &Vec<u8>) -> Result<(), io::Err
 }
 
 pub fn simulate_connections() {
-    let address = get_host_and_port();
-
     let connection_simulator = thread::spawn(move || {
         let mut streams = Vec::new();
         for sth in ["one", "two", "three", "four", "five"] {
-            let mut stream = TcpStream::connect(address.clone())
+            let mut stream = TcpStream::connect("127.0.0.1:11111")
                 .expect("TCP stream connection from another thread should be possible.");
             let bytes = serialize_msg(&Message::Text(sth.to_string()));
             send_bytes(&mut stream, &bytes).expect("sending bytes to the server should work");

@@ -1,22 +1,42 @@
 use std::{fs, io::Write, net::TcpStream, path::Path, thread, time::Duration};
 
-use cli_ser::{get_host_and_port, read_msg, send_bytes, serialize_msg, Command, Message};
+use clap::Parser;
+
+use cli_ser::{read_msg, send_bytes, serialize_msg, Command, Message};
 
 /* // Dunno how to do lazy statics...
 use once_cell::sync::Lazy;
 static FILES_DIR: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("files"));
 */
 
+/// Client executable, interactively sends messages to the specified server.
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Server host
+    #[arg(long, default_value_t = String::from("127.0.0.1"))]
+    host: String,
+
+    /// Server port
+    #[arg(short, long, default_value_t = 11111)]
+    port: u32,
+
+    /// Save all images as PNG.
+    #[arg(short, long, default_value_t = false)]
+    save_png: bool,
+}
+
 fn main() {
-    let save_as_png = true; // TODO
     let files_dir = Path::new("files");
     let images_dir = Path::new("images");
+
+    let args = Args::parse();
+
     fs::create_dir_all(files_dir).expect("Directory for files couldn't be created.");
     fs::create_dir_all(images_dir).expect("Directory for images couldn't be created.");
 
-    let address = get_host_and_port();
-    let mut stream =
-        TcpStream::connect(address).expect("Connection to the server should be possible.");
+    let mut stream = TcpStream::connect(format!("{}:{}", args.host, args.port))
+        .expect("Connection to the server should be possible.");
 
     let mut sc = stream
         .try_clone()
@@ -35,7 +55,7 @@ fn main() {
                         .expect("Writing the file failed.");
                 }
                 Message::Image(image) => {
-                    if save_as_png {
+                    if args.save_png {
                         image.save_as_png(images_dir);
                     } else {
                         image.save(images_dir);

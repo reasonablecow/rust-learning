@@ -6,10 +6,25 @@ use std::{
     thread,
 };
 
+use clap::Parser;
+
 use crate::Task::*;
-use cli_ser::{get_host_and_port, read_msg, send_bytes, serialize_msg, Message};
+use cli_ser::{read_msg, send_bytes, serialize_msg, Message};
 
 const MSCP_ERROR: &str = "Sending message over the mpsc channel should always work.";
+
+/// Server executable, listens at specified address and broadcasts messages to all connected clients.
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Server host
+    #[arg(long, default_value_t = String::from("127.0.0.1"))]
+    host: String,
+
+    /// Server port
+    #[arg(short, long, default_value_t = 11111)]
+    port: u32,
+}
 
 #[derive(Debug)]
 enum Task {
@@ -20,10 +35,11 @@ enum Task {
 }
 
 fn main() {
-    let address = get_host_and_port();
+    let args = Args::parse();
 
     let (sender, receiver) = mpsc::channel();
 
+    let address = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&address).expect("TCP listener creation should not fail.");
     println!("Server is listening at {:?}", address);
 
