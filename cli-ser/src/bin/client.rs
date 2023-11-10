@@ -1,4 +1,4 @@
-use std::{fs, io::Write, net::TcpStream, path::Path, thread, time::Duration};
+use std::{fs, io::Write, net::TcpStream, path::Path, sync::mpsc, thread, time::Duration};
 
 use clap::Parser;
 
@@ -38,12 +38,15 @@ fn main() {
     let mut stream = TcpStream::connect(format!("{}:{}", args.host, args.port))
         .expect("Connection to the server should be possible.");
 
-    let mut sc = stream
+    let mut stream_clone = stream
         .try_clone()
         .expect("The TcpStream should be cloneable.");
 
-    let _receiver = thread::spawn(move || loop {
-        if let Some(msg) = read_msg(&mut sc) {
+    // Channel to indicate to stop waiting for messages.
+    let (sender, receiver) = mpsc::channel::<bool>();
+
+    let receiver = thread::spawn(move || loop {
+        if let Some(msg) = read_msg(&mut stream_clone) {
             match msg {
                 Message::Text(text) => println!("{}", text),
                 Message::File(f) => {
@@ -63,14 +66,18 @@ fn main() {
                     println!("Received image...");
                 }
             }
+        } else if receiver.try_recv().is_ok() {
+            break;
         }
-        thread::sleep(Duration::from_millis(100));
     });
 
     loop {
         let msg = match Command::from_stdin() {
             Command::Quit => {
                 println!("Goodbye!");
+                // Time for messages which were sent but were not receivable yet.
+                thread::sleep(Duration::from_secs(5));
+                sender.send(true).expect("Program crashed during closing.");
                 break;
             }
             cmd => Message::from_cmd(cmd).expect("User provided wrong command."),
@@ -78,4 +85,8 @@ fn main() {
         send_bytes(&mut stream, &serialize_msg(&msg))
             .expect("Sending of you message failed, please restart and try again.");
     }
+
+    receiver
+        .join()
+        .expect("Message receiver crashed, sorry for the inconvenience.");
 }
