@@ -1,6 +1,10 @@
 //! # Server Executable
 //!
 //! Listens at a specified address and broadcasts every received message to all other connected clients.
+//! See:
+//! ```sh
+//! cargo run -- --help
+//! ```
 use std::{
     collections::HashMap,
     fs,
@@ -52,6 +56,8 @@ enum Task {
 /// A separate "listening" thread is dedicated to capturing new clients.
 /// In the main loop, the server processes tasks one at a time from its queue.
 /// Small tasks are resolved immediately, while for larger ones, a new thread is spawned.
+///
+/// TODO: Make a thread pool to address the inefficiency of thread spawning.
 fn main() {
     let _log_file_guard = init_logging_stdout_and_file();
 
@@ -99,7 +105,9 @@ fn main() {
                 info!("broadcasting message from {:?}", addr_from);
                 let bytes = serialize_msg(&msg);
 
-                for (&addr_to, stream) in &streams {
+                // TODO streams.par_iter() - rayon - does not work,
+                // parallel loop instead of thread spawning would be nice.
+                for (&addr_to, stream) in streams.iter() {
                     if addr_from != addr_to {
                         let sender_clone = sender.clone();
                         let mut stream_clone =
@@ -138,7 +146,7 @@ fn init_logging_stdout_and_file() -> WorkerGuard {
         "{}.log",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     ))
-    .unwrap();
+    .expect("Log file creation should be possible, please check your permissions.");
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
