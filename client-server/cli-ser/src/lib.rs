@@ -1,4 +1,6 @@
 //! Client-Server Utilities
+//!
+//! TODO: cli-ser error enum instead of all panics
 
 use std::{
     error::Error,
@@ -83,7 +85,7 @@ impl Image {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct File {
-    // the fields could be private with getters as well
+    // TODO: make the fields private with getters for future stability
     pub name: PathBuf,
     pub bytes: Vec<u8>,
 }
@@ -148,7 +150,6 @@ pub enum Command {
 
 impl Command {
     pub fn from_stdin() -> Command {
-        println!("Please type the command:");
         let mut line = String::new();
         io::stdin()
             .read_line(&mut line)
@@ -228,7 +229,8 @@ pub fn send_bytes(stream: &mut TcpStream, bytes: &Vec<u8>) -> Result<(), io::Err
     Ok(())
 }
 
-/// DON'T USE! However it was useful for testing.
+/// Deprecated! Useful for testing initially.
+/// TODO: Add a test simulating simple client and server.
 pub fn _simulate_connections() {
     let connection_simulator = thread::spawn(move || {
         let mut streams = Vec::new();

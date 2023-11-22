@@ -78,6 +78,7 @@ fn main() {
 
     // Parses and executes commands given by the user.
     loop {
+        println!("Please type the command:");
         let msg = match Command::from_stdin() {
             Command::Quit => {
                 println!("Goodbye!");
