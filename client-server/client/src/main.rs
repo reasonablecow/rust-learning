@@ -1,3 +1,9 @@
+//! # Client Executable
+//!
+//! See:
+//! ```sh
+//! cargo run -- --help
+//! ```
 use std::{fs, io::Write, net::TcpStream, path::Path, sync::mpsc, thread, time::Duration};
 
 use clap::Parser;
@@ -40,7 +46,7 @@ fn main() {
     fs::create_dir_all(images_dir).expect("Directory for images couldn't be created.");
 
     let mut stream = TcpStream::connect(format!("{}:{}", args.host, args.port))
-        .expect("Connection to the server should be possible.");
+        .expect("Connection to the server failed, please make sure the server is running.");
 
     let mut stream_clone = stream
         .try_clone()
