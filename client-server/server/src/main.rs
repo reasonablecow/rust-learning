@@ -1,3 +1,6 @@
+//! # Server Executable
+//!
+//! Listens at a specified address and broadcasts every received message to all other connected clients.
 use std::{
     collections::HashMap,
     io::ErrorKind::BrokenPipe,
@@ -26,7 +29,7 @@ struct Args {
     port: u32,
 }
 
-/// Server tasks which are queued and addressed.
+/// Tasks to be initially queued at the server and addressed later.
 #[derive(Debug)]
 enum Task {
     NewStream(TcpStream),
@@ -35,12 +38,12 @@ enum Task {
     StreamClose(SocketAddr),
 }
 
-/// Server's main function consisting of a "welcoming" thread and server's main loop.
+/// The server's main function consists of a "listening" thread and the server's main loop.
 ///
-/// The server listens at specified address (host and port).
-/// One separate "welcoming" thread is dedicated to capture new clients.
-/// In the main loop the server takes one task at a time from a queue.
-/// Small tasks solves by itself and for more complicated once spawns a new thread.
+/// The server is bound to a specified address (host and port).
+/// A separate "listening" thread is dedicated to capturing new clients.
+/// In the main loop, the server processes tasks one at a time from its queue.
+/// Small tasks are resolved immediately, while for larger ones, a new thread is spawned.
 fn main() {
     let args = Args::parse();
 
