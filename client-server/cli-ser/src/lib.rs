@@ -1,8 +1,4 @@
 //! Client-Server Utilities
-//!
-//! ## Examples
-//! * https://rustacean.net/assets/rustacean-orig-noshadow.png
-//! * https://github.com/rust-community/resources/blob/gh-pages/sticker/rust/examples/hexagon.jpeg
 
 use std::{
     error::Error,

@@ -23,3 +23,10 @@ The `server` also depends on the `cli-ser` crate.
 ## [cli-ser](./cli-ser)
 
 Library crate that proves to be handy when implementing either a client or server.
+
+## [Example images](./example-images)
+
+Example images were taken from these sites:
+
+* <https://rustacean.net/assets/rustacean-orig-noshadow.png>
+* <https://github.com/rust-community/resources/blob/gh-pages/sticker/rust/examples/hexagon.jpeg>
