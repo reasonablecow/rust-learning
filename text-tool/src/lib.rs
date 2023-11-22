@@ -1,7 +1,6 @@
 use core::fmt;
 use regex::Regex;
-use std::error::Error;
-use std::str::FromStr;
+use std::{error::Error, str::FromStr};
 
 pub enum Transformation {
     Lowercase,
