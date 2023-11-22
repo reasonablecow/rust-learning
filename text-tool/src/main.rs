@@ -12,9 +12,7 @@
 //! <example.txt cargo run >out.txt; echo "Errors? $?"
 //! ```
 
-use std::error::Error;
-use std::sync::mpsc;
-use std::{env, fs, io, thread};
+use std::{env, error::Error, fs, io, sync::mpsc, thread};
 use text_tool::Transformation;
 
 /// Prints transformed standard input based on its values and arguments given.
