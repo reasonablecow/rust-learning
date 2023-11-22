@@ -3,13 +3,21 @@
 //! Listens at a specified address and broadcasts every received message to all other connected clients.
 use std::{
     collections::HashMap,
+    fs,
     io::ErrorKind::BrokenPipe,
     net::{SocketAddr, TcpListener, TcpStream},
     sync::mpsc,
     thread,
 };
 
+use chrono::{offset::Utc, SecondsFormat};
 use clap::Parser;
+use tracing::info;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{
+    filter::LevelFilter, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
+    Layer,
+};
 
 use crate::Task::*;
 use cli_ser::{read_msg, send_bytes, serialize_msg, Message};
@@ -45,19 +53,21 @@ enum Task {
 /// In the main loop, the server processes tasks one at a time from its queue.
 /// Small tasks are resolved immediately, while for larger ones, a new thread is spawned.
 fn main() {
+    let _log_file_guard = init_logging_stdout_and_file();
+
     let args = Args::parse();
 
     let (sender, receiver) = mpsc::channel();
 
     let address = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&address).expect("TCP listener creation should not fail.");
-    println!("Server is listening at {:?}", address);
+    info!("Server is listening at {:?}", address);
 
     let sender_clone = sender.clone();
     let _stream_receiver = thread::spawn(move || {
         for incoming in listener.incoming() {
             let stream = incoming.expect("Incoming Stream should be Ok");
-            println!("incoming {:?}", stream);
+            info!("incoming {:?}", stream);
             sender_clone.send(NewStream(stream)).expect(MSCP_ERROR);
         }
     });
@@ -86,7 +96,7 @@ fn main() {
                 } // The stream was removed from streams after the Check creation.
             }
             Broadcast(addr_from, msg) => {
-                println!("broadcasting message from {:?}", addr_from);
+                info!("broadcasting message from {:?}", addr_from);
                 let bytes = serialize_msg(&msg);
 
                 for (&addr_to, stream) in &streams {
@@ -109,11 +119,35 @@ fn main() {
                 }
             }
             StreamClose(addr) => {
-                println!("disconnected {}", addr);
+                info!("disconnected {}", addr);
                 streams
                     .remove(&addr)
                     .expect("Stream was present and should have been so until now.");
             }
         }
     }
+}
+
+/// Subscribes to tracing (and logging), outputs to stdout and a log file.
+///
+/// Returns WorkerGuard which must be kept for the intended time of log capturing.
+fn init_logging_stdout_and_file() -> WorkerGuard {
+    let term_layer = tracing_subscriber::fmt::layer().with_filter(LevelFilter::INFO);
+
+    let file = fs::File::create(format!(
+        "{}.log",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    ))
+    .unwrap();
+    let (non_blocking, guard) = tracing_appender::non_blocking(file);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_filter(LevelFilter::TRACE);
+
+    tracing_subscriber::registry()
+        .with(term_layer)
+        .with(file_layer)
+        .init(); // sets itself as global default subscriber
+
+    guard
 }
