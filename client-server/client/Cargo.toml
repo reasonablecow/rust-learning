@@ -7,4 +7,4 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.4.8", features = ["derive"] }
-cli-ser = { git = "https://github.com/reasonablecow/rust-learning.git", branch = "hw06" }
+cli-ser = { path = "../cli-ser" }
