@@ -45,7 +45,7 @@ impl ImageFormat {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct Image {
     format: ImageFormat,
     bytes: Vec<u8>,
@@ -83,7 +83,7 @@ impl Image {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct File {
     // TODO: make the fields private with getters for future stability
     pub name: PathBuf,
@@ -91,7 +91,7 @@ pub struct File {
 }
 
 /// Messages to be sent over the network.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum Message {
     Text(String),
     File(File),
