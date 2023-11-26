@@ -5,6 +5,8 @@
 //! ```sh
 //! cargo run -- --help
 //! ```
+//!
+//! TODO: Messages received from one client should be broadcasted in the same order as received.
 use std::{
     collections::HashMap,
     fs,
