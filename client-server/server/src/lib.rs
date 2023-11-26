@@ -12,7 +12,7 @@ use std::{
     fs,
     io::ErrorKind::BrokenPipe,
     net::{SocketAddr, TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, Arc, Mutex},
     thread,
 };
 
@@ -43,7 +43,6 @@ pub struct Args {
     #[arg(short, long, default_value_t = 11111)]
     port: u32,
 }
-
 impl Args {
     pub fn parse_to_address() -> String {
         let args = Self::parse();
@@ -65,9 +64,9 @@ enum Task {
 /// The server is bound to a specified address (host and port).
 /// A separate "listening" thread is dedicated to capturing new clients.
 /// In the main loop, the server processes tasks one at a time from its queue.
-/// Small tasks are resolved immediately, while for larger ones, a new thread is spawned.
+/// Small tasks are resolved immediately, larger once are delegated to a thread pool.
 ///
-/// TODO: Make a thread pool to address the inefficiency of thread spawning.
+/// TODO: Make thread pool size configurable by the caller.
 pub fn run(address: &str) {
     let (task_taker, task_giver) = mpsc::channel();
 
@@ -83,6 +82,7 @@ pub fn run(address: &str) {
         }
     });
 
+    let workers = ThreadPool::new(6);
     let mut streams: HashMap<SocketAddr, TcpStream> = HashMap::new();
     for task in task_giver {
         match task {
@@ -98,7 +98,7 @@ pub fn run(address: &str) {
                     let task_taker_clone = task_taker.clone();
                     let mut stream_clone = stream.try_clone().expect("Stream should be cloneable.");
 
-                    let _check_thread = thread::spawn(move || {
+                    workers.execute(move || {
                         if let Some(msg) = read_msg(&mut stream_clone) {
                             task_taker_clone
                                 .send(Broadcast(addr, msg))
@@ -112,8 +112,6 @@ pub fn run(address: &str) {
                 info!("broadcasting message from {:?}", addr_from);
                 let bytes = serialize_msg(&msg);
 
-                // TODO streams.par_iter() - rayon - does not work,
-                // parallel loop instead of thread spawning would be nice.
                 for (&addr_to, stream) in streams.iter() {
                     if addr_from != addr_to {
                         let task_taker_clone = task_taker.clone();
@@ -121,7 +119,7 @@ pub fn run(address: &str) {
                             stream.try_clone().expect("Stream should be cloneable.");
                         let bytes_clone = bytes.clone();
 
-                        let _sender_thread = thread::spawn(move || {
+                        workers.execute(move || {
                             match send_bytes(&mut stream_clone, &bytes_clone) {
                                 Ok(()) => {}
                                 Err(e) if e.kind() == BrokenPipe => {
@@ -142,6 +140,40 @@ pub fn run(address: &str) {
                     .expect("Stream was present and should have been so until now.");
             }
         }
+    }
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// Structure for executing jobs in parallel on fixed number of threads.
+///
+/// Inspired by: <https://doc.rust-lang.org/book/ch20-02-multithreaded.html>
+struct ThreadPool {
+    channel: mpsc::Sender<Job>,
+    _threads: Vec<thread::JoinHandle<()>>,
+}
+impl ThreadPool {
+    fn new(thread_cnt: usize) -> ThreadPool {
+        let (channel, job_recv) = mpsc::channel();
+        let job_recv = Arc::new(Mutex::new(job_recv));
+
+        let _threads = (0..thread_cnt)
+            .map(|_| {
+                let job_recv_clone = Arc::clone(&job_recv);
+                thread::spawn(move || loop {
+                    let job: Job = job_recv_clone.lock().unwrap().recv().unwrap();
+                    job();
+                })
+            })
+            .collect::<Vec<_>>();
+        ThreadPool { channel, _threads }
+    }
+
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.channel.send(Box::new(f)).unwrap();
     }
 }
 
