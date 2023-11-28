@@ -20,22 +20,24 @@ use regex::Regex;
 
 use cli_ser::{read_msg, send_bytes, serialize_msg, Message};
 
-/* // Dunno how to do lazy statics...
+/* // TODO: lazy statics for paths
 use once_cell::sync::Lazy;
 static FILES_DIR: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("files"));
 */
+const HOST_DEFAULT: &str = "127.0.0.1"; // TODO - representation other than str
+const PORT_DEFAULT: u16 = 11111;
 
 /// Client executable, interactively sends messages to the specified server.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Server host
-    #[arg(long, default_value_t = String::from("127.0.0.1"))]
+    #[arg(long, default_value_t = String::from(HOST_DEFAULT))]
     host: String,
 
     /// Server port
-    #[arg(short, long, default_value_t = 11111)]
-    port: u32,
+    #[arg(short, long, default_value_t = PORT_DEFAULT)]
+    port: u16,
 
     /// Save all images as PNG.
     #[arg(short, long, default_value_t = false)]
@@ -63,7 +65,7 @@ pub fn run() {
         .expect("The TcpStream should be cloneable.");
 
     // Channel to indicate to stop waiting for messages.
-    let (end_sender, end_receiver) = mpsc::channel();
+    let (send_quit, recv_quit) = mpsc::channel();
 
     // Reads messages from the server in the background.
     let receiver = thread::spawn(move || loop {
@@ -71,6 +73,7 @@ pub fn run() {
             match msg {
                 Message::Text(text) => println!("{}", text),
                 Message::File(f) => {
+                    // TODO save
                     println!("Received {:?}", f.name);
                     let path = files_dir.join(f.name);
                     fs::File::create(path)
@@ -80,14 +83,14 @@ pub fn run() {
                 }
                 Message::Image(image) => {
                     if args.save_png {
-                        image.save_as_png(images_dir);
+                        image.save_as_png(images_dir); // TODO - convert and save?
                     } else {
                         image.save(images_dir);
                     }
                     println!("Received image...");
                 }
             }
-        } else if end_receiver.try_recv().is_ok() {
+        } else if recv_quit.try_recv().is_ok() {
             break;
         }
     });
@@ -95,14 +98,12 @@ pub fn run() {
     // Parses and executes commands given by the user.
     loop {
         println!("Please type the command:");
-        let msg = match Command::from_stdin() {
+        let msg = match Command::from(&*read_line_from_stdin()) {
             Command::Quit => {
                 println!("Goodbye!");
                 // Time for messages which were sent but were not receivable yet.
                 thread::sleep(Duration::from_secs(5));
-                end_sender
-                    .send(true)
-                    .expect("Program crashed during closing.");
+                send_quit.send(()).expect("Program crashed during closing.");
                 break;
             }
             cmd => Message::try_from(cmd).expect("User provided wrong command."),
@@ -117,6 +118,20 @@ pub fn run() {
         .expect("Message receiver crashed, sorry for the inconvenience.");
 }
 
+/// Reads line from standard input, strips ending newline if present.
+/// TODO - return result
+fn read_line_from_stdin() -> String {
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .expect("reading line to get the command failed");
+    if let Some(stripped) = line.strip_suffix('\n') {
+        stripped.to_string()
+    } else {
+        line
+    }
+}
+
 /// Commands useful for the client user.
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -125,39 +140,25 @@ pub enum Command {
     Image(String),
     Other(String),
 }
-
-impl Command {
-    pub fn from_stdin() -> Command {
-        let mut line = String::new();
-        io::stdin()
-            .read_line(&mut line)
-            .expect("reading standard input should work.");
-        let line = if let Some(stripped) = line.strip_suffix('\n') {
-            stripped.to_string()
-        } else {
-            line
-        };
-        Command::from_str(&line)
-    }
-
-    fn from_str(s: &str) -> Command {
+/// Converts the first line of the borrowed str to Command, rest is ignored.
+impl From<&str> for Command {
+    fn from(value: &str) -> Self {
         let err_msg = "unexpected regex error, contact the crate implementer";
         let reg_quit = Regex::new(r"^\s*\.quit\s*$").expect(err_msg);
         let reg_file = Regex::new(r"^\s*\.file\s+(?<file>\S+.*)\s*$").expect(err_msg);
         let reg_image = Regex::new(r"^\s*\.image\s+(?<image>\S+.*)\s*$").expect(err_msg);
 
-        if reg_quit.is_match(s) {
+        if reg_quit.is_match(value) {
             Command::Quit
-        } else if let Some((_, [file])) = reg_file.captures(s).map(|caps| caps.extract()) {
+        } else if let Some((_, [file])) = reg_file.captures(value).map(|caps| caps.extract()) {
             Command::File(file.to_string())
-        } else if let Some((_, [image])) = reg_image.captures(s).map(|caps| caps.extract()) {
+        } else if let Some((_, [image])) = reg_image.captures(value).map(|caps| caps.extract()) {
             Command::Image(image.to_string())
         } else {
-            Command::Other(s.to_string())
+            Command::Other(value.to_string())
         }
     }
 }
-
 impl TryFrom<Command> for Message {
     type Error = Box<dyn Error>;
 
@@ -177,8 +178,8 @@ mod tests {
 
     #[test]
     fn command_from_str_quit() {
-        assert_eq!(Command::Quit, Command::from_str(".quit"));
-        assert_eq!(Command::Quit, Command::from_str("      .quit      "));
+        assert_eq!(Command::Quit, Command::from(".quit"));
+        assert_eq!(Command::Quit, Command::from("      .quit      "));
     }
 
     #[test]
@@ -186,7 +187,7 @@ mod tests {
         let f = "a.txt";
         assert_eq!(
             Command::File(String::from(f)),
-            Command::from_str(&format!(".file {}", f))
+            Command::from(&*format!(".file {}", f))
         );
     }
 
@@ -195,20 +196,20 @@ mod tests {
         let i = "i.png";
         assert_eq!(
             Command::Image(String::from(i)),
-            Command::from_str(&format!(".image {}", i))
+            Command::from(&*format!(".image {}", i))
         );
     }
 
     #[test]
     fn command_from_str_other() {
         for s in [". quit", ".quit      s", "a   .quit "] {
-            assert_eq!(Command::Other(String::from(s)), Command::from_str(s));
+            assert_eq!(Command::Other(String::from(s)), Command::from(s));
         }
     }
 
     #[test]
     fn test_run() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:11111")
+        let listener = std::net::TcpListener::bind(format!("{}:{}", HOST_DEFAULT, PORT_DEFAULT))
             .expect("TCP listener creation should not fail.");
         let server_thread = thread::spawn(move || {
             std::iter::from_fn(|| listener.incoming().next()).collect::<Vec<_>>()
