@@ -3,12 +3,12 @@
 //! TODO: cli-ser error enum instead of all panics
 
 use std::{
+    error::Error,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Cursor, ErrorKind, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
-    thread,
-    time::Duration,
 };
 
 use chrono::{offset::Utc, SecondsFormat};
@@ -45,22 +45,23 @@ pub struct Image {
     bytes: Vec<u8>,
 }
 impl Image {
-    pub fn save(&self, dir: &Path) {
-        fs::File::create(Self::create_path(dir, self.format))
-            .expect("File creation failed.")
-            .write_all(&self.bytes)
-            .expect("Writing the file failed.");
+    pub fn save(&self, dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+        let path = Self::create_path(dir, self.format);
+        fs::File::create(&path)? // File creation failed.
+            .write_all(&self.bytes)?; // Writing the file failed.
+        Ok(path)
     }
 
-    pub fn save_as_png(self, dir: &Path) {
+    pub fn save_as_png(self, dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
         if self.format != ImageFormat::Png {
+            let path = Self::create_path(dir, ImageFormat::Png);
             image::io::Reader::with_format(Cursor::new(self.bytes), self.format)
-                .decode()
-                .expect("Image decoding failed.")
-                .save_with_format(Self::create_path(dir, ImageFormat::Png), ImageFormat::Png)
-                .expect("Encoding and writing to a file should work.");
+                .decode()? // Image decoding failed.
+                // Encoding and writing to a file should work.
+                .save_with_format(&path, ImageFormat::Png)?;
+            Ok(path)
         } else {
-            self.save(dir);
+            self.save(dir)
         }
     }
 
@@ -73,12 +74,50 @@ impl Image {
         ))
     }
 }
+impl TryFrom<&Path> for Image {
+    type Error = Box<dyn Error>;
+
+    fn try_from(value: &Path) -> Result<Self, Self::Error> {
+        let reader = image::io::Reader::open(value)? // Image opening failed.
+            .with_guessed_format()?;
+        let format = reader
+            .format()
+            .ok_or_else(|| format!("Image image format of \"{:?}\" wasn't recognized.", value))?;
+
+        let mut bytes = Vec::new();
+        reader.into_inner().read_to_end(&mut bytes)?; // Reading the specified file failed.
+        Ok(Image { format, bytes })
+    }
+}
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct File {
-    // TODO: make the fields private with getters for future stability
-    pub name: PathBuf,
-    pub bytes: Vec<u8>,
+    name: OsString,
+    bytes: Vec<u8>,
+}
+impl File {
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), io::Error> {
+        fs::File::create(path.as_ref().join(&self.name))? // File creation failed.
+            .write_all(&self.bytes)?; // Writing the file failed.
+        Ok(())
+    }
+}
+impl TryFrom<&Path> for File {
+    type Error = Box<dyn Error>;
+
+    fn try_from(value: &Path) -> Result<Self, Self::Error> {
+        let name = value
+            .file_name()
+            .ok_or("Path given does not end with a valid file name.")?
+            .to_os_string();
+        let mut file = fs::File::open(value)?; // File for the given path can not be opened.
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?; //Reading the specified file failed.
+        Ok(File { name, bytes })
+    }
 }
 
 /// Messages to be sent over the network.
@@ -89,34 +128,22 @@ pub enum Message {
     Image(Image),
 }
 impl Message {
-    pub fn file_from_path(path: String) -> Message {
-        let path = PathBuf::from(path);
-        let name = path
-            .file_name()
-            .expect("Path given does not end with a valid file name.")
-            .into();
-        let mut file = fs::File::open(path).expect("File for the given path can not be opened.");
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .expect("Reading the specified file failed.");
-        Message::File(File { name, bytes })
+    pub fn file_from_path(path: impl AsRef<Path>) -> Result<Message, Box<dyn Error>> {
+        Ok(File::try_from(path.as_ref())?.into())
     }
 
-    pub fn img_from_path(path: String) -> Message {
-        let reader = image::io::Reader::open(path)
-            .expect("Image opening failed.")
-            .with_guessed_format()
-            .expect("The format should be deducible.");
-
-        let format = reader.format().expect("The image format must be clear!");
-
-        let mut bytes = Vec::new();
-        reader
-            .into_inner()
-            .read_to_end(&mut bytes)
-            .expect("Reading the specified file failed.");
-
-        Message::Image(Image { format, bytes })
+    pub fn img_from_path(path: impl AsRef<Path>) -> Result<Message, Box<dyn Error>> {
+        Ok(Image::try_from(path.as_ref())?.into())
+    }
+}
+impl From<File> for Message {
+    fn from(value: File) -> Message {
+        Message::File(value)
+    }
+}
+impl From<Image> for Message {
+    fn from(value: Image) -> Message {
+        Message::Image(value)
     }
 }
 
@@ -160,32 +187,9 @@ pub fn serialize_msg(msg: &Message) -> Vec<u8> {
 }
 
 /// Sends bytes over given stream.
-///
-/// Panics! BrokenPipe error kind occurs when sending a message to a closed stream.
 pub fn send_bytes(stream: &mut TcpStream, bytes: &Vec<u8>) -> Result<(), io::Error> {
     stream.write_all(&((bytes.len() as u32).to_be_bytes()))?;
     stream.write_all(bytes)?;
     stream.flush()?;
     Ok(())
-}
-
-/// Deprecated! Useful for testing initially.
-/// TODO: Add a test simulating simple client and server.
-pub fn _simulate_connections() {
-    let connection_simulator = thread::spawn(move || {
-        let mut streams = Vec::new();
-        for sth in ["one", "two", "three", "four", "five"] {
-            let mut stream = TcpStream::connect("127.0.0.1:11111")
-                .expect("TCP stream connection from another thread should be possible.");
-            let bytes = serialize_msg(&Message::Text(sth.to_string()));
-            send_bytes(&mut stream, &bytes).expect("sending bytes to the server should work");
-            streams.push(stream);
-        }
-        streams
-    });
-    let streams = connection_simulator
-        .join()
-        .expect("the streams should be returned.");
-    println!("{:?}", streams);
-    thread::sleep(Duration::from_secs(3));
 }

@@ -4,16 +4,7 @@
 //! ```sh
 //! cargo run -- --help
 //! ```
-use std::{
-    error::Error,
-    fs,
-    io::{self, Write},
-    net::TcpStream,
-    path::Path,
-    sync::mpsc,
-    thread,
-    time::Duration,
-};
+use std::{error::Error, fs, io, net::TcpStream, path::Path, sync::mpsc, thread, time::Duration};
 
 use clap::Parser;
 use regex::Regex;
@@ -73,21 +64,21 @@ pub fn run() {
             match msg {
                 Message::Text(text) => println!("{}", text),
                 Message::File(f) => {
-                    // TODO save
-                    println!("Received {:?}", f.name);
-                    let path = files_dir.join(f.name);
-                    fs::File::create(path)
-                        .expect("File creation failed.")
-                        .write_all(&f.bytes)
-                        .expect("Writing the file failed.");
+                    println!("Received {:?}", f.name());
+                    f.save(files_dir).unwrap_or_else(|e| {
+                        eprintln!("...saving the file \"{:?}\" failed! Err: {:?}", f.name(), e)
+                    });
                 }
                 Message::Image(image) => {
-                    if args.save_png {
-                        image.save_as_png(images_dir); // TODO - convert and save?
-                    } else {
-                        image.save(images_dir);
-                    }
                     println!("Received image...");
+                    match if args.save_png {
+                        image.save_as_png(images_dir)
+                    } else {
+                        image.save(images_dir)
+                    } {
+                        Ok(path) => println!("...image was saved to {:?}", path),
+                        Err(e) => eprintln!("...saving the image failed! Err: {:?}", e),
+                    }
                 }
             }
         } else if recv_quit.try_recv().is_ok() {
@@ -166,8 +157,8 @@ impl TryFrom<Command> for Message {
         match value {
             Command::Quit => Err("A Massage can not be constructed from a Quit command!".into()),
             Command::Other(s) => Ok(Message::Text(s)),
-            Command::File(path) => Ok(Message::file_from_path(path)),
-            Command::Image(path) => Ok(Message::img_from_path(path)),
+            Command::File(path) => Ok(Message::file_from_path(path)?),
+            Command::Image(path) => Ok(Message::img_from_path(path)?),
         }
     }
 }
