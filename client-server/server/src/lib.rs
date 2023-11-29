@@ -26,7 +26,11 @@ use tracing_subscriber::{
 };
 
 use crate::Task::*;
-use cli_ser::{read_msg, send_bytes, serialize_msg, Message};
+use cli_ser::{
+    send_bytes,
+    Error::{SendByteCnt, SendBytes},
+    Message,
+};
 
 const MSCP_ERROR: &str = "Sending message over the mpsc channel should always work.";
 pub const ADDRESS_DEFAULT: &str = "127.0.0.1:11111";
@@ -99,7 +103,9 @@ pub fn run(address: &str) {
                     let mut stream_clone = stream.try_clone().expect("Stream should be cloneable.");
 
                     workers.execute(move || {
-                        if let Some(msg) = read_msg(&mut stream_clone) {
+                        if let Some(msg) = Message::receive(&mut stream_clone)
+                            .expect("message receiving should not fail")
+                        {
                             task_taker_clone
                                 .send(Broadcast(addr, msg))
                                 .expect(MSCP_ERROR);
@@ -110,7 +116,9 @@ pub fn run(address: &str) {
             }
             Broadcast(addr_from, msg) => {
                 info!("broadcasting message from {:?}", addr_from);
-                let bytes = serialize_msg(&msg);
+                let bytes = msg
+                    .serialize()
+                    .expect("message serialization should not fail");
 
                 for (&addr_to, stream) in streams.iter() {
                     if addr_from != addr_to {
@@ -122,7 +130,9 @@ pub fn run(address: &str) {
                         workers.execute(move || {
                             match send_bytes(&mut stream_clone, &bytes_clone) {
                                 Ok(()) => {}
-                                Err(e) if e.kind() == BrokenPipe => {
+                                Err(SendByteCnt(e)) | Err(SendBytes(e))
+                                    if e.kind() == BrokenPipe =>
+                                {
                                     task_taker_clone
                                         .send(StreamClose(addr_to))
                                         .expect(MSCP_ERROR);

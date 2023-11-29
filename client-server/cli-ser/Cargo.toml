@@ -11,3 +11,4 @@ chrono = "0.4.31"
 clap = { version = "4.4.7", features = ["derive"] }
 image = "0.24.7"
 serde = { version = "1.0.190", features = ["derive"] }
+thiserror = "1.0.50"

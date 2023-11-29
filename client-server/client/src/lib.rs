@@ -9,7 +9,7 @@ use std::{error::Error, fs, io, net::TcpStream, path::Path, sync::mpsc, thread, 
 use clap::Parser;
 use regex::Regex;
 
-use cli_ser::{read_msg, send_bytes, serialize_msg, Message};
+use cli_ser::{send_bytes, Message};
 
 /* // TODO: lazy statics for paths
 use once_cell::sync::Lazy;
@@ -60,7 +60,9 @@ pub fn run() {
 
     // Reads messages from the server in the background.
     let receiver = thread::spawn(move || loop {
-        if let Some(msg) = read_msg(&mut stream_clone) {
+        if let Some(msg) =
+            Message::receive(&mut stream_clone).expect("reading bytes should never fail")
+        {
             match msg {
                 Message::Text(text) => println!("{}", text),
                 Message::File(f) => {
@@ -99,7 +101,10 @@ pub fn run() {
             }
             cmd => Message::try_from(cmd).expect("User provided wrong command."),
         };
-        send_bytes(&mut stream, &serialize_msg(&msg))
+        let bytes = msg
+            .serialize()
+            .expect("message serialization should always work.");
+        send_bytes(&mut stream, &bytes)
             .expect("Sending of you message failed, please restart and try again.");
     }
 

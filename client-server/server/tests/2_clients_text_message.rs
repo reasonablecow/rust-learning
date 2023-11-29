@@ -7,10 +7,12 @@ fn client(s: &str) -> Message {
     let mut stream =
         TcpStream::connect(ADDRESS_DEFAULT).expect("connecting to the server should succeed");
     thread::sleep(Duration::from_millis(100)); // wait for client connections
-    cli_ser::send_bytes(&mut stream, &cli_ser::serialize_msg(&msg))
+    msg.send(&mut stream)
         .expect("sending of bytes should succeed");
     thread::sleep(Duration::from_millis(100)); // wait for messages to be sent
-    cli_ser::read_msg(&mut stream).expect("receiving of a message should succeed")
+    Message::receive(&mut stream)
+        .expect("receiving of a message should succeed")
+        .expect("message should not be None")
 }
 
 #[test]
