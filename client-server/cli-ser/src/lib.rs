@@ -12,39 +12,35 @@ use std::{
 };
 
 use chrono::{offset::Utc, SecondsFormat};
+use image::ImageFormat;
 use serde::{Deserialize, Serialize};
 
-/// This whole thing wouldn't exist if image::ImageFormat would be serializable
+/// Remote definition of image::ImageFormat for de/serialization.
+/// Based on <https://serde.rs/remote-derive.html>.
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
-pub enum ImageFormat {
+#[serde(remote = "ImageFormat")]
+#[non_exhaustive]
+pub enum ImageFormatDef {
     Png,
     Jpeg,
-    //... I hope there is a better way to solve this but otherwise here would go the duplicates.
-}
-impl ImageFormat {
-    fn to_str(self) -> &'static str {
-        // Every format has at least one <https://docs.rs/image/latest/src/image/image.rs.html#290-309>.
-        self.to_official().extensions_str()[0]
-    }
-
-    fn to_official(self) -> image::ImageFormat {
-        match self {
-            ImageFormat::Png => image::ImageFormat::Png,
-            ImageFormat::Jpeg => image::ImageFormat::Jpeg,
-        }
-    }
-
-    pub fn from_official(format: image::ImageFormat) -> Self {
-        match format {
-            image::ImageFormat::Png => ImageFormat::Png,
-            image::ImageFormat::Jpeg => ImageFormat::Jpeg,
-            _ => todo!(),
-        }
-    }
+    Gif,
+    WebP,
+    Pnm,
+    Tiff,
+    Tga,
+    Dds,
+    Bmp,
+    Ico,
+    Hdr,
+    OpenExr,
+    Farbfeld,
+    Avif,
+    Qoi,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct Image {
+    #[serde(with = "ImageFormatDef")]
     format: ImageFormat,
     bytes: Vec<u8>,
 }
@@ -58,13 +54,10 @@ impl Image {
 
     pub fn save_as_png(self, dir: &Path) {
         if self.format != ImageFormat::Png {
-            image::io::Reader::with_format(Cursor::new(self.bytes), self.format.to_official())
+            image::io::Reader::with_format(Cursor::new(self.bytes), self.format)
                 .decode()
                 .expect("Image decoding failed.")
-                .save_with_format(
-                    Self::create_path(dir, ImageFormat::Png),
-                    image::ImageFormat::Png,
-                )
+                .save_with_format(Self::create_path(dir, ImageFormat::Png), ImageFormat::Png)
                 .expect("Encoding and writing to a file should work.");
         } else {
             self.save(dir);
@@ -75,7 +68,8 @@ impl Image {
         dir.join(format!(
             "{}.{}",
             Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            format.to_str()
+            // It's safe: <https://docs.rs/image/latest/src/image/image.rs.html#290-309>.
+            format.extensions_str()[0]
         ))
     }
 }
@@ -114,8 +108,7 @@ impl Message {
             .with_guessed_format()
             .expect("The format should be deducible.");
 
-        let format =
-            ImageFormat::from_official(reader.format().expect("The image format must be clear!"));
+        let format = reader.format().expect("The image format must be clear!");
 
         let mut bytes = Vec::new();
         reader
