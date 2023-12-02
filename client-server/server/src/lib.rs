@@ -26,11 +26,7 @@ use tracing_subscriber::{
 };
 
 use crate::Task::*;
-use cli_ser::{
-    send_bytes,
-    Error::{SendByteCnt, SendBytes},
-    Message,
-};
+use cli_ser::{send_bytes, Error::SendBytes, Message};
 
 const MSCP_ERROR: &str = "Sending message over the mpsc channel should always work.";
 pub const ADDRESS_DEFAULT: &str = "127.0.0.1:11111";
@@ -130,13 +126,9 @@ pub fn run(address: &str) {
                         workers.execute(move || {
                             match send_bytes(&mut stream_clone, &bytes_clone) {
                                 Ok(()) => {}
-                                Err(SendByteCnt(e)) | Err(SendBytes(e))
-                                    if e.kind() == BrokenPipe =>
-                                {
-                                    task_taker_clone
-                                        .send(StreamClose(addr_to))
-                                        .expect(MSCP_ERROR);
-                                }
+                                Err(SendBytes(e)) if e.kind() == BrokenPipe => task_taker_clone
+                                    .send(StreamClose(addr_to))
+                                    .expect(MSCP_ERROR),
                                 other => panic!("{:?}", other),
                             }
                         });

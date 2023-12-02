@@ -20,24 +20,24 @@ type Result<T> = result::Result<T, Error>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("setting TCP stream to a nonblocking mode (to check for a receivable bytes) failed")]
-    SetNonblocking(io::Error),
-    #[error("setting TCP stream to a blocking mode (to read all bytes together) failed")]
-    SetBlocking(io::Error),
-    #[error("receiving byte count from the stream failed")]
-    ReceiveByteCnt(io::Error),
     #[error("receiving bytes from the stream failed")]
     ReceiveBytes(io::Error),
-    #[error("sending byte count over the stream failed")]
-    SendByteCnt(io::Error),
     #[error("sending bytes over the stream failed")]
     SendBytes(io::Error),
-    #[error("flushing the stream failed")]
-    FlushStream(io::Error),
-    #[error("serialization of the message failed")]
+    #[error("message serialization failed")]
     SerializeMsg(bincode::Error),
     #[error("deserialization of the message failed")]
     DeserializeMsg(bincode::Error),
+    #[error("saving the file failed")]
+    SaveFile(io::Error),
+    #[error("saving the image failed")]
+    SaveImg(io::Error),
+    #[error("operation convert and save image failed")]
+    ConvertAndSaveImg(image::error::ImageError),
+    #[error("operation load img and guess format failed")]
+    LoadImgGuessFormat(Box<dyn error::Error>),
+    #[error("loading file for a given path failed")]
+    LoadFile(Box<dyn error::Error>),
 }
 
 /// Remote definition of image::ImageFormat for de/serialization.
@@ -70,21 +70,39 @@ pub struct Image {
     bytes: Vec<u8>,
 }
 impl Image {
-    pub fn save(&self, dir: &Path) -> result::Result<PathBuf, Box<dyn error::Error>> {
-        let path = Self::create_path(dir, self.format);
-        fs::File::create(&path)? // File creation failed.
-            .write_all(&self.bytes)?; // Writing the file failed.
-        Ok(path)
+    /// Creates Image from bytes read at path, guesses the image format based on the data.
+    fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let reader = image::io::Reader::open(path)
+            .and_then(|r| r.with_guessed_format())
+            .map_err(|e| LoadImgGuessFormat(e.into()))?;
+        let format = reader.format().ok_or_else(|| {
+            LoadImgGuessFormat(format!("image format of \"{:?}\" wasn't recognized.", path).into())
+        })?;
+
+        let mut bytes = Vec::new();
+        reader
+            .into_inner()
+            .read_to_end(&mut bytes)
+            .map_err(|e| LoadImgGuessFormat(e.into()))?;
+        Ok(Image { format, bytes })
     }
 
-    pub fn save_as_png(self, dir: &Path) -> result::Result<PathBuf, Box<dyn error::Error>> {
+    pub fn save(&self, dir: &Path) -> Result<PathBuf> {
+        let path = Self::create_path(dir, self.format);
+        create_file_and_write_bytes(&path, &self.bytes)
+            .map(|_| path)
+            .map_err(SaveImg)
+    }
+
+    pub fn save_as_png(self, dir: &Path) -> Result<PathBuf> {
         if self.format != ImageFormat::Png {
             let path = Self::create_path(dir, ImageFormat::Png);
             image::io::Reader::with_format(Cursor::new(self.bytes), self.format)
-                .decode()? // Image decoding failed.
-                // Encoding and writing to a file should work.
-                .save_with_format(&path, ImageFormat::Png)?;
-            Ok(path)
+                .decode()
+                .and_then(|d| d.save_with_format(&path, ImageFormat::Png))
+                .map(|_| path)
+                .map_err(ConvertAndSaveImg)
         } else {
             self.save(dir)
         }
@@ -99,21 +117,6 @@ impl Image {
         ))
     }
 }
-impl TryFrom<&Path> for Image {
-    type Error = Box<dyn error::Error>;
-
-    fn try_from(value: &Path) -> result::Result<Self, Self::Error> {
-        let reader = image::io::Reader::open(value)? // Image opening failed.
-            .with_guessed_format()?;
-        let format = reader
-            .format()
-            .ok_or_else(|| format!("Image image format of \"{:?}\" wasn't recognized.", value))?;
-
-        let mut bytes = Vec::new();
-        reader.into_inner().read_to_end(&mut bytes)?; // Reading the specified file failed.
-        Ok(Image { format, bytes })
-    }
-}
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct File {
@@ -121,28 +124,31 @@ pub struct File {
     bytes: Vec<u8>,
 }
 impl File {
+    fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let name = path
+            .as_ref()
+            .file_name()
+            .ok_or(LoadFile(
+                "Path given does not end with a valid file name.".into(),
+            ))?
+            .to_os_string();
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .map_err(|e| LoadFile(e.into()))?;
+        Ok(File { name, bytes })
+    }
+
     pub fn name(&self) -> &OsStr {
         &self.name
     }
-    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        fs::File::create(path.as_ref().join(&self.name))? // File creation failed.
-            .write_all(&self.bytes)?; // Writing the file failed.
-        Ok(())
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        create_file_and_write_bytes(path.as_ref().join(&self.name), &self.bytes).map_err(SaveFile)
     }
 }
-impl TryFrom<&Path> for File {
-    type Error = Box<dyn error::Error>;
 
-    fn try_from(value: &Path) -> result::Result<Self, Self::Error> {
-        let name = value
-            .file_name()
-            .ok_or("Path given does not end with a valid file name.")?
-            .to_os_string();
-        let mut file = fs::File::open(value)?; // File for the given path can not be opened.
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?; //Reading the specified file failed.
-        Ok(File { name, bytes })
-    }
+fn create_file_and_write_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
+    fs::File::create(path)?.write_all(bytes)
 }
 
 /// Messages to be sent over the network.
@@ -153,12 +159,14 @@ pub enum Message {
     Image(Image),
 }
 impl Message {
-    pub fn file_from_path(path: impl AsRef<Path>) -> result::Result<Self, Box<dyn error::Error>> {
-        Ok(File::try_from(path.as_ref())?.into())
+    /// Loads File from a path.
+    pub fn file_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        File::from_path(path).map(Message::from)
     }
 
-    pub fn img_from_path(path: impl AsRef<Path>) -> result::Result<Self, Box<dyn error::Error>> {
-        Ok(Image::try_from(path.as_ref())?.into())
+    /// Loads Image from a path.
+    pub fn img_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        Image::from_path(path).map(Message::from)
     }
 
     /// Serializes Message into bytes.
@@ -171,6 +179,7 @@ impl Message {
         bincode::deserialize(bytes).map_err(DeserializeMsg)
     }
 
+    /// Tries to receive a message from the given stream.
     pub fn receive(stream: &mut TcpStream) -> Result<Option<Self>> {
         receive_bytes(stream)?
             .as_deref()
@@ -178,6 +187,7 @@ impl Message {
             .transpose()
     }
 
+    /// Sends a message over the given stream.
     pub fn send(&self, stream: &mut TcpStream) -> Result<()> {
         self.serialize()
             .and_then(|bytes| send_bytes(stream, &bytes))
@@ -198,21 +208,22 @@ impl From<Image> for Message {
 ///
 /// Asks for the byte count in a non-blocking manner; upon success, the byte reading becomes blocking.
 pub fn receive_bytes(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
-    stream.set_nonblocking(true).map_err(SetNonblocking)?;
+    stream.set_nonblocking(true).map_err(ReceiveBytes)?;
     let mut len_bytes = [0u8; 4];
     match stream.read_exact(&mut len_bytes) {
-        Ok(()) => {
-            stream.set_nonblocking(false).map_err(SetBlocking)?;
-            let len = u32::from_be_bytes(len_bytes) as usize;
-            let mut bytes = vec![0u8; len];
-            stream.read_exact(&mut bytes).map_err(ReceiveBytes)?;
-            Ok(Some(bytes))
-        }
+        Ok(()) => stream
+            .set_nonblocking(false)
+            .and_then(|_| {
+                let len = u32::from_be_bytes(len_bytes) as usize;
+                let mut bytes = vec![0u8; len];
+                stream.read_exact(&mut bytes).map(|_| Some(bytes))
+            })
+            .map_err(ReceiveBytes),
         Err(e) => match e.kind() {
             ErrorKind::WouldBlock // No message is ready
             | ErrorKind::UnexpectedEof // The stream was closed
             => Ok(None),
-            _ => Err(ReceiveByteCnt(e)),
+            _ => Err(ReceiveBytes(e)),
         },
     }
 }
@@ -221,8 +232,7 @@ pub fn receive_bytes(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
 pub fn send_bytes(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     stream
         .write_all(&((bytes.len() as u32).to_be_bytes()))
-        .map_err(SendByteCnt)?;
-    stream.write_all(bytes).map_err(SendBytes)?;
-    stream.flush().map_err(FlushStream)?;
-    Ok(())
+        .and_then(|_| stream.write_all(bytes))
+        .and_then(|_| stream.flush())
+        .map_err(SendBytes)
 }
