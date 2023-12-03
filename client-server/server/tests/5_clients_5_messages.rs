@@ -9,6 +9,13 @@ fn to_text(s: &str) -> cli_ser::Message {
     Text(s.to_string())
 }
 
+fn from_text(t: Message) -> String {
+    match t {
+        Text(s) => s,
+        _ => panic!("{:?}", t),
+    }
+}
+
 #[test]
 fn test_5_clients_5_messages() {
     let server_thread = thread::spawn(|| run(ADDRESS_DEFAULT));
@@ -28,8 +35,9 @@ fn test_5_clients_5_messages() {
     assert_eq!(
         Message::receive(&mut client_2)
             .expect("Receiving message for client_2 failed")
+            .map(from_text)
             .expect("Message received for client_2 should not be None"),
-        to_text(msg_1)
+        msg_1
     );
     // client_2 quits
     drop(client_2);
@@ -71,8 +79,9 @@ fn test_5_clients_5_messages() {
     {
         assert_eq!(
             from_fn(|| Message::receive(&mut stream).expect(&format!("{}", num)))
+                .map(from_text)
                 .collect::<Vec<_>>(),
-            msgs.iter().map(|s| to_text(s)).collect::<Vec<_>>()
+            msgs
         )
     }
     assert!(!server_thread.is_finished());

@@ -82,6 +82,7 @@ pub fn run() {
                         Err(e) => eprintln!("...saving the image failed! Err: {:?}", e),
                     }
                 }
+                Message::Error(err_text) => eprintln!("received error: \"{}\"", err_text),
             }
         } else if recv_quit.try_recv().is_ok() {
             break;
@@ -158,7 +159,7 @@ impl From<&str> for Command {
 impl TryFrom<Command> for Message {
     type Error = Box<dyn Error>;
 
-    fn try_from(value: Command) -> Result<Self, Self::Error> {
+    fn try_from(value: Command) -> Result<Self, <cli_ser::Message as TryFrom<Command>>::Error> {
         match value {
             Command::Quit => Err("A Massage can not be constructed from a Quit command!".into()),
             Command::Other(s) => Ok(Message::Text(s)),

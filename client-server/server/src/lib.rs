@@ -10,7 +10,6 @@
 use std::{
     collections::HashMap,
     fs,
-    io::ErrorKind::BrokenPipe,
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{mpsc, Arc, Mutex},
     thread,
@@ -18,7 +17,7 @@ use std::{
 
 use chrono::{offset::Utc, SecondsFormat};
 use clap::Parser;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
     filter::LevelFilter, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
@@ -26,9 +25,8 @@ use tracing_subscriber::{
 };
 
 use crate::Task::*;
-use cli_ser::{send_bytes, Error::SendBytes, Message};
+use cli_ser::{send_bytes, Error::DisconnectedStream, Message};
 
-const MSCP_ERROR: &str = "Sending message over the mpsc channel should always work.";
 pub const ADDRESS_DEFAULT: &str = "127.0.0.1:11111";
 
 /// Server executable, listens at specified address and broadcasts messages to all connected clients.
@@ -55,6 +53,7 @@ impl Args {
 enum Task {
     NewStream(TcpStream),
     Check(SocketAddr),
+    SendErrMsg(SocketAddr, String),
     Broadcast(SocketAddr, Message),
     StreamClose(SocketAddr),
 }
@@ -76,9 +75,15 @@ pub fn run(address: &str) {
     let task_taker_clone = task_taker.clone();
     let _stream_receiver = thread::spawn(move || {
         for incoming in listener.incoming() {
-            let stream = incoming.expect("Incoming Stream should be Ok");
-            info!("incoming {:?}", stream);
-            task_taker_clone.send(NewStream(stream)).expect(MSCP_ERROR);
+            match incoming {
+                Ok(stream) => {
+                    info!("incoming {:?}", stream);
+                    task_taker_clone
+                        .send(NewStream(stream))
+                        .unwrap_or_else(|e| error!("sending NewStream to tasks failed: {:?}", e))
+                }
+                Err(e) => error!("incoming stream error: {:?}", e),
+            }
         }
     });
 
@@ -86,60 +91,106 @@ pub fn run(address: &str) {
     let mut streams: HashMap<SocketAddr, TcpStream> = HashMap::new();
     for task in task_giver {
         match task {
-            NewStream(stream) => {
-                let addr = stream
-                    .peer_addr()
-                    .expect("Every stream should have accessible address.");
-                streams.insert(addr, stream);
-                task_taker.send(Check(addr)).expect(MSCP_ERROR);
-            }
+            NewStream(stream) => match stream.peer_addr() {
+                Ok(addr) => {
+                    streams.insert(addr, stream);
+                    task_taker.send(Check(addr)).unwrap_or_else(|e| {
+                        error!("sending Check(\"{}\") to tasks failed, error: {}", addr, e)
+                    })
+                }
+                Err(e) => error!(
+                    "reading address of new stream {:?} failed, error {}",
+                    stream, e
+                ),
+            },
             Check(addr) => {
                 if let Some(stream) = streams.get(&addr) {
                     let task_taker_clone = task_taker.clone();
-                    let mut stream_clone = stream.try_clone().expect("Stream should be cloneable.");
-
-                    workers.execute(move || {
-                        if let Some(msg) = Message::receive(&mut stream_clone)
-                            .expect("message receiving should not fail")
-                        {
-                            task_taker_clone
-                                .send(Broadcast(addr, msg))
-                                .expect(MSCP_ERROR);
+                    match stream.try_clone() {
+                        Ok(mut stream_clone) => {
+                            workers.execute(move || {
+                                let check_again = || task_taker_clone.send(Check(addr)).unwrap_or_else(|e| error!("sending Check({addr}) to tasks failed, error {e}"));
+                                match Message::receive(&mut stream_clone) {
+                                    Ok(Some(msg)) => {
+                                        task_taker_clone
+                                            .send(Broadcast(addr, msg))
+                                            .unwrap_or_else(|e| error!("sending Broadcast from \"{addr}\" to tasks failed, error {e:?}"));
+                                        check_again();
+                                    }
+                                    Ok(None) => check_again(),
+                                    Err(cli_ser::Error::DisconnectedStream(_)) => {
+                                        info!("disconnected {}", addr);
+                                        task_taker_clone.send(StreamClose(addr)).unwrap_or_else(|e| error!("sending StreamClose({addr}) to tasks failed, error {e}"));
+                                    }
+                                    Err(e) => {
+                                        error!("receiving message from stream {addr} failed, error {e}");
+                                        check_again();
+                                    }
+                                }
+                            }).unwrap_or_else(|e| error!("sending a job to the thread pool failed, error {e}"))
                         }
-                        task_taker_clone.send(Check(addr)).expect(MSCP_ERROR);
-                    });
+                        Err(e) => error!("cloning stream to check incoming message failed {}", e),
+                    }
+                } else {
+                    warn!("stream for address {} wasn't found in order to check for incoming messages", addr)
                 } // The stream was removed from streams after the Check creation.
+            }
+            SendErrMsg(addr, body) => {
+                let fail_msg = format!(
+                    "sending error message \"{:?}\", to \"{:?}\" failed",
+                    body, addr
+                );
+                let fail_msg_clone = fail_msg.clone();
+                match streams.get(&addr).map(|s| s.try_clone()) {
+                    Some(Ok(mut stream)) => workers.execute(move || {
+                        Message::Error(body)
+                            .send(&mut stream)
+                            .unwrap_or_else(|e| error!("{fail_msg_clone}, error: {e:?}"));
+                    }).unwrap_or_else(|e| error!("{fail_msg}, because sending a job to the thread pool failed, error {e}")),
+                    Some(Err(e)) => error!("{fail_msg}, because cloning stream for address {addr:?} failed, error {e:?}"),
+                    None => error!(
+                        "{}, because stream for address {:?} was not found",
+                        fail_msg, addr
+                    ),
+                }
             }
             Broadcast(addr_from, msg) => {
                 info!("broadcasting message from {:?}", addr_from);
-                let bytes = msg
-                    .serialize()
-                    .expect("message serialization should not fail");
+                match msg.serialize() {
+                    Ok(bytes) => {
+                        for (&addr_to, stream) in streams.iter() {
+                            if addr_from != addr_to {
+                                match stream.try_clone() {
+                                    Ok(mut stream_clone) => {
+                                        let task_taker_clone = task_taker.clone();
+                                        let bytes_clone = bytes.clone();
 
-                for (&addr_to, stream) in streams.iter() {
-                    if addr_from != addr_to {
-                        let task_taker_clone = task_taker.clone();
-                        let mut stream_clone =
-                            stream.try_clone().expect("Stream should be cloneable.");
-                        let bytes_clone = bytes.clone();
-
-                        workers.execute(move || {
-                            match send_bytes(&mut stream_clone, &bytes_clone) {
-                                Ok(()) => {}
-                                Err(SendBytes(e)) if e.kind() == BrokenPipe => task_taker_clone
-                                    .send(StreamClose(addr_to))
-                                    .expect(MSCP_ERROR),
-                                other => panic!("{:?}", other),
+                                        workers.execute(move || {
+                                        match send_bytes(&mut stream_clone, &bytes_clone) {
+                                            Ok(()) => {}
+                                            Err(DisconnectedStream(_)) => {}
+                                            other => {
+                                                let body = format!("broadcasting message to client \"{:?}\" failed, error: {:?}", addr_to, other);
+                                                task_taker_clone.send(Task::SendErrMsg(addr_from, body.clone()))
+                                                    .unwrap_or_else(|e| error!("sending SendErrMsg({addr_from}, {body}) to tasks failed, error {e}"))
+                                                }
+                                            }
+                                        }).unwrap_or_else(|e| error!("sending a broadcast job (from {addr_from} to {addr_to}) to the thread pool failed, error {e}"));
+                                    }
+                                    Err(e) => error!("cloning stream of {addr_to} (in order to broadcast message) failed, error {e}"),
+                                }
                             }
-                        });
+                        }
+                    }
+                    Err(e) => {
+                        error!("serialization of a message (from {addr_from}) failed, error {e}")
                     }
                 }
             }
             StreamClose(addr) => {
-                info!("disconnected {}", addr);
-                streams
-                    .remove(&addr)
-                    .expect("Stream was present and should have been so until now.");
+                streams.remove(&addr).expect(
+                    "removing stream should never fail, contact the implementer! (address {addr})",
+                );
             }
         }
     }
@@ -156,26 +207,33 @@ struct ThreadPool {
 }
 impl ThreadPool {
     fn new(thread_cnt: usize) -> ThreadPool {
-        let (channel, job_recv) = mpsc::channel();
+        let (channel, job_recv) = mpsc::channel::<Job>();
         let job_recv = Arc::new(Mutex::new(job_recv));
 
         let _threads = (0..thread_cnt)
             .map(|_| {
                 let job_recv_clone = Arc::clone(&job_recv);
                 thread::spawn(move || loop {
-                    let job: Job = job_recv_clone.lock().unwrap().recv().unwrap();
-                    job();
+                    let job_result = job_recv_clone
+                        .lock()
+                        .expect("acquiring a mutex to receive a job failed")
+                        .recv();
+                    match job_result {
+                        Ok(job) => job(),
+                        Err(e) => error!("receiving a job from job queue failed, error {e}"),
+                    }
                 })
             })
             .collect::<Vec<_>>();
         ThreadPool { channel, _threads }
     }
 
-    pub fn execute<F>(&self, f: F)
+    pub fn execute<F>(&self, f: F) -> std::result::Result<(), Box<dyn std::error::Error>>
     where
         F: FnOnce() + Send + 'static,
     {
-        self.channel.send(Box::new(f)).unwrap();
+        self.channel.send(Box::new(f))?;
+        Ok(())
     }
 }
 

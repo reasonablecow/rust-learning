@@ -22,6 +22,8 @@ type Result<T> = result::Result<T, Error>;
 pub enum Error {
     #[error("receiving bytes from the stream failed")]
     ReceiveBytes(io::Error),
+    #[error("the stream was disconnected")]
+    DisconnectedStream(io::Error),
     #[error("sending bytes over the stream failed")]
     SendBytes(io::Error),
     #[error("message serialization failed")]
@@ -152,11 +154,14 @@ fn create_file_and_write_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io::Resu
 }
 
 /// Messages to be sent over the network.
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+///
+/// TODO: Client can send Error message to the server which is confusing.
+#[derive(Serialize, Deserialize, Debug)]
 pub enum Message {
     Text(String),
     File(File),
     Image(Image),
+    Error(String),
 }
 impl Message {
     /// Loads File from a path.
@@ -220,9 +225,8 @@ pub fn receive_bytes(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
             })
             .map_err(ReceiveBytes),
         Err(e) => match e.kind() {
-            ErrorKind::WouldBlock // No message is ready
-            | ErrorKind::UnexpectedEof // The stream was closed
-            => Ok(None),
+            ErrorKind::WouldBlock => Ok(None), // No message is ready
+            ErrorKind::UnexpectedEof => Err(DisconnectedStream(e)),
             _ => Err(ReceiveBytes(e)),
         },
     }
@@ -234,5 +238,11 @@ pub fn send_bytes(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
         .write_all(&((bytes.len() as u32).to_be_bytes()))
         .and_then(|_| stream.write_all(bytes))
         .and_then(|_| stream.flush())
-        .map_err(SendBytes)
+        .map_err(|e| {
+            if e.kind() == ErrorKind::BrokenPipe {
+                DisconnectedStream(e)
+            } else {
+                SendBytes(e)
+            }
+        })
 }
