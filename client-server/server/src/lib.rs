@@ -15,6 +15,7 @@ use std::{
     thread,
 };
 
+use anyhow::Context;
 use chrono::{offset::Utc, SecondsFormat};
 use clap::Parser;
 use tracing::{error, info, warn};
@@ -66,10 +67,11 @@ enum Task {
 /// Small tasks are resolved immediately, larger once are delegated to a thread pool.
 ///
 /// TODO: Make thread pool size configurable by the caller.
-pub fn run(address: &str) {
+pub fn run(address: &str) -> anyhow::Result<()> {
     let (task_taker, task_giver) = mpsc::channel();
 
-    let listener = TcpListener::bind(address).expect("TCP listener creation should not fail.");
+    let listener =
+        TcpListener::bind(address).with_context(|| "TCP listener creation should not fail.")?;
     info!("Server is listening at {:?}", address);
 
     let task_taker_clone = task_taker.clone();
@@ -188,12 +190,13 @@ pub fn run(address: &str) {
                 }
             }
             StreamClose(addr) => {
-                streams.remove(&addr).expect(
-                    "removing stream should never fail, contact the implementer! (address {addr})",
-                );
+                streams.remove(&addr).with_context(|| {
+                    "removing stream should never fail, contact the implementer! (address {addr})"
+                })?;
             }
         }
     }
+    Ok(())
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -201,6 +204,8 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 /// Structure for executing jobs in parallel on fixed number of threads.
 ///
 /// Inspired by: <https://doc.rust-lang.org/book/ch20-02-multithreaded.html>
+///
+/// Warning: The thread pool can not recover from a poisoned mutex on the job channel.
 struct ThreadPool {
     channel: mpsc::Sender<Job>,
     _threads: Vec<thread::JoinHandle<()>>,
@@ -228,6 +233,8 @@ impl ThreadPool {
         ThreadPool { channel, _threads }
     }
 
+    /// TODO: Can not use anyhow, because Box<dyn FnOnce() + Send + 'static>
+    /// can not be shared between threads.
     pub fn execute<F>(&self, f: F) -> std::result::Result<(), Box<dyn std::error::Error>>
     where
         F: FnOnce() + Send + 'static,
@@ -240,14 +247,14 @@ impl ThreadPool {
 /// Subscribes to tracing (and logging), outputs to stdout and a log file.
 ///
 /// Returns WorkerGuard which must be kept for the intended time of log capturing.
-pub fn init_logging_stdout_and_file() -> WorkerGuard {
+pub fn init_logging_stdout_and_file() -> anyhow::Result<WorkerGuard> {
     let term_layer = tracing_subscriber::fmt::layer().with_filter(LevelFilter::INFO);
 
     let file = fs::File::create(format!(
         "{}.log",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     ))
-    .expect("Log file creation should be possible, please check your permissions.");
+    .with_context(|| "Log file creation should be possible, please check your permissions.")?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
@@ -257,8 +264,7 @@ pub fn init_logging_stdout_and_file() -> WorkerGuard {
         .with(term_layer)
         .with(file_layer)
         .init(); // sets itself as global default subscriber
-
-    guard
+    Ok(guard)
 }
 
 #[cfg(test)]

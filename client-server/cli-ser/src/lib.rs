@@ -1,7 +1,6 @@
 //! Client-Server Utilities
 
 use std::{
-    error,
     ffi::{OsStr, OsString},
     fs,
     io::{self, Cursor, ErrorKind, Read, Write},
@@ -36,10 +35,10 @@ pub enum Error {
     SaveImg(io::Error),
     #[error("operation convert and save image failed")]
     ConvertAndSaveImg(image::error::ImageError),
-    #[error("operation load img and guess format failed")]
-    LoadImgGuessFormat(Box<dyn error::Error>),
+    #[error("loading image with format guessing failed")]
+    LoadImg(io::Error),
     #[error("loading file for a given path failed")]
-    LoadFile(Box<dyn error::Error>),
+    LoadFile(io::Error),
 }
 
 /// Remote definition of image::ImageFormat for de/serialization.
@@ -73,20 +72,22 @@ pub struct Image {
 }
 impl Image {
     /// Creates Image from bytes read at path, guesses the image format based on the data.
+    ///
+    /// Panics: When <https://docs.rs/image/latest/image/io/struct.Reader.html#method.with_guessed_format>
+    /// doesn't fail, but <https://docs.rs/image/latest/image/io/struct.Reader.html#method.format> does.
+    /// Based on the documentation it should never happen.
     fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let reader = image::io::Reader::open(path)
             .and_then(|r| r.with_guessed_format())
-            .map_err(|e| LoadImgGuessFormat(e.into()))?;
-        let format = reader.format().ok_or_else(|| {
-            LoadImgGuessFormat(format!("image format of \"{:?}\" wasn't recognized.", path).into())
-        })?;
+            .map_err(LoadImg)?;
+        let format = reader.format().expect("Bug in the crate \"image \"! This should never fail when the previous step has succeeded.");
 
         let mut bytes = Vec::new();
         reader
             .into_inner()
             .read_to_end(&mut bytes)
-            .map_err(|e| LoadImgGuessFormat(e.into()))?;
+            .map_err(LoadImg)?;
         Ok(Image { format, bytes })
     }
 
@@ -127,17 +128,15 @@ pub struct File {
 }
 impl File {
     fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .map_err(LoadFile)?;
         let name = path
             .as_ref()
             .file_name()
-            .ok_or(LoadFile(
-                "Path given does not end with a valid file name.".into(),
-            ))?
+            .unwrap_or(OsStr::new("unknown"))
             .to_os_string();
-        let mut bytes = Vec::new();
-        fs::File::open(path)
-            .and_then(|mut f| f.read_to_end(&mut bytes))
-            .map_err(|e| LoadFile(e.into()))?;
         Ok(File { name, bytes })
     }
 
