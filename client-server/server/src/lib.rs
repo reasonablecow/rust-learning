@@ -54,10 +54,12 @@ impl Args {
 enum Task {
     NewStream(TcpStream),
     Check(SocketAddr),
-    SendErrMsg(SocketAddr, String),
+    SendErr(SocketAddr, cli_ser::ServerErr),
     Broadcast(SocketAddr, Message),
     StreamClose(SocketAddr),
 }
+
+type Streams = HashMap<SocketAddr, TcpStream>;
 
 /// The server's main function consists of a "listening" thread and the server's main loop.
 ///
@@ -90,7 +92,7 @@ pub fn run(address: &str) -> anyhow::Result<()> {
     });
 
     let workers = ThreadPool::new(6);
-    let mut streams: HashMap<SocketAddr, TcpStream> = HashMap::new();
+    let mut streams: Streams = HashMap::new();
     for task in task_giver {
         match task {
             NewStream(stream) => match stream.peer_addr() {
@@ -106,94 +108,112 @@ pub fn run(address: &str) -> anyhow::Result<()> {
                 ),
             },
             Check(addr) => {
-                if let Some(stream) = streams.get(&addr) {
-                    let task_taker_clone = task_taker.clone();
-                    match stream.try_clone() {
-                        Ok(mut stream_clone) => {
-                            workers.execute(move || {
-                                let check_again = || task_taker_clone.send(Check(addr)).unwrap_or_else(|e| error!("sending Check({addr}) to tasks failed, error {e}"));
-                                match Message::receive(&mut stream_clone) {
-                                    Ok(Some(msg)) => {
-                                        task_taker_clone
-                                            .send(Broadcast(addr, msg))
-                                            .unwrap_or_else(|e| error!("sending Broadcast from \"{addr}\" to tasks failed, error {e:?}"));
-                                        check_again();
-                                    }
-                                    Ok(None) => check_again(),
-                                    Err(cli_ser::Error::DisconnectedStream(_)) => {
-                                        info!("disconnected {}", addr);
-                                        task_taker_clone.send(StreamClose(addr)).unwrap_or_else(|e| error!("sending StreamClose({addr}) to tasks failed, error {e}"));
-                                    }
-                                    Err(e) => {
-                                        error!("receiving message from stream {addr} failed, error {e}");
-                                        check_again();
-                                    }
-                                }
-                            }).unwrap_or_else(|e| error!("sending a job to the thread pool failed, error {e}"))
-                        }
-                        Err(e) => error!("cloning stream to check incoming message failed {}", e),
-                    }
-                } else {
-                    warn!("stream for address {} wasn't found in order to check for incoming messages", addr)
-                } // The stream was removed from streams after the Check creation.
+                check(addr, &streams, &workers, task_taker.clone());
             }
-            SendErrMsg(addr, body) => {
-                let fail_msg = format!(
-                    "sending error message \"{:?}\", to \"{:?}\" failed",
-                    body, addr
-                );
+            SendErr(addr, err) => {
+                let fail_msg = format!("sending error message \"{err:?}\", to \"{addr:?}\" failed");
                 let fail_msg_clone = fail_msg.clone();
+
                 match streams.get(&addr).map(|s| s.try_clone()) {
                     Some(Ok(mut stream)) => workers.execute(move || {
-                        Message::Error(body)
-                            .send(&mut stream)
-                            .unwrap_or_else(|e| error!("{fail_msg_clone}, error: {e:?}"));
+                        Message::ServerErr(err).send(&mut stream).unwrap_or_else(|e| error!("{fail_msg_clone}, error: {e:?}"));
                     }).unwrap_or_else(|e| error!("{fail_msg}, because sending a job to the thread pool failed, error {e}")),
                     Some(Err(e)) => error!("{fail_msg}, because cloning stream for address {addr:?} failed, error {e:?}"),
-                    None => error!(
-                        "{}, because stream for address {:?} was not found",
-                        fail_msg, addr
-                    ),
+                    None => error!("{fail_msg}, because stream for address {addr:?} was not found")
                 }
             }
             Broadcast(addr_from, msg) => {
                 info!("broadcasting message from {:?}", addr_from);
-                match msg.serialize() {
-                    Ok(bytes) => {
-                        for (&addr_to, stream) in streams.iter() {
-                            if addr_from != addr_to {
-                                match stream.try_clone() {
-                                    Ok(mut stream_clone) => {
-                                        let task_taker_clone = task_taker.clone();
-                                        let bytes_clone = bytes.clone();
-
-                                        workers.execute(move || {
-                                        match send_bytes(&mut stream_clone, &bytes_clone) {
-                                            Ok(()) => {}
-                                            Err(DisconnectedStream(_)) => {}
-                                            other => {
-                                                let body = format!("broadcasting message to client \"{:?}\" failed, error: {:?}", addr_to, other);
-                                                task_taker_clone.send(Task::SendErrMsg(addr_from, body.clone()))
-                                                    .unwrap_or_else(|e| error!("sending SendErrMsg({addr_from}, {body}) to tasks failed, error {e}"))
-                                                }
-                                            }
-                                        }).unwrap_or_else(|e| error!("sending a broadcast job (from {addr_from} to {addr_to}) to the thread pool failed, error {e}"));
-                                    }
-                                    Err(e) => error!("cloning stream of {addr_to} (in order to broadcast message) failed, error {e}"),
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("serialization of a message (from {addr_from}) failed, error {e}")
-                    }
-                }
+                broadcast(msg, addr_from, &streams, &workers, &task_taker)
+                    .with_context(|| "broadcasting message from {addr_from} failed")
+                    .unwrap_or_else(|e| error!("{}", e))
             }
             StreamClose(addr) => {
                 streams.remove(&addr).with_context(|| {
                     "removing stream should never fail, contact the implementer! (address {addr})"
                 })?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Checks address for incoming messages, queues broadcast and another check.
+///
+/// TODO: Send ServerErr message when receiving fails.
+fn check(addr: SocketAddr, streams: &Streams, workers: &ThreadPool, tasks: mpsc::Sender<Task>) {
+    let Some(stream) = streams.get(&addr) else {
+        // The stream was probably removed after the Check creation.
+        warn!("stream for address {addr} wasn't found in order to check for incoming messages");
+        return;
+    };
+    let mut stream_clone = match stream.try_clone() {
+        Ok(sc) => sc,
+        Err(e) => return error!("cloning stream to check incoming message failed {e}"),
+    };
+    workers
+        .execute(move || {
+            let check_again = || {
+                tasks
+                    .send(Check(addr))
+                    .unwrap_or_else(|e| error!("sending Check({addr}) to tasks failed, error {e}"))
+            };
+            match Message::receive(&mut stream_clone) {
+                Ok(Some(msg)) => {
+                    tasks.send(Broadcast(addr, msg)).unwrap_or_else(|e| {
+                        error!("sending Broadcast from \"{addr}\" to tasks failed, error {e:?}")
+                    });
+                    check_again();
+                }
+                Ok(None) => check_again(),
+                Err(cli_ser::Error::DisconnectedStream(_)) => {
+                    info!("disconnected {}", addr);
+                    tasks.send(StreamClose(addr)).unwrap_or_else(|e| {
+                        error!("sending StreamClose({addr}) to tasks failed, error {e}")
+                    });
+                }
+                Err(e) => {
+                    error!("receiving message from stream {addr} failed, error {e}");
+                    check_again();
+                }
+            }
+        })
+        .unwrap_or_else(|e| error!("sending a job to the thread pool failed, error {e}"))
+}
+
+/// Sends message to all streams except the `addr_from` using workers ThreadPool
+fn broadcast(
+    msg: Message,
+    addr_from: SocketAddr,
+    streams: &Streams,
+    workers: &ThreadPool,
+    tasks: &mpsc::Sender<Task>,
+) -> anyhow::Result<()> {
+    let bytes = msg
+        .serialize()
+        .with_context(|| "message serialization failed")?;
+    for (&addr_to, stream) in streams.iter() {
+        if addr_from != addr_to {
+            let mut stream_clone = stream
+                .try_clone()
+                .with_context(|| "cloning stream failed")?;
+            let bytes_clone = bytes.clone();
+            let tasks_clone = tasks.clone();
+
+            let err_msg = |addr| format!("sending message to client \"{addr:?}\" failed");
+            workers.execute(move || match send_bytes(&mut stream_clone, &bytes_clone) {
+                Ok(()) => {}
+                Err(DisconnectedStream(_)) => {}
+                other => {
+                    let err = cli_ser::ServerErr::Sending(format!("{}, because {other:?}", err_msg(addr_to)));
+                    tasks_clone.send(Task::SendErr(addr_from, err.clone()))
+                        .unwrap_or_else(|e| error!("sending SendErr({addr_from}, {err:?}) to tasks failed, error {e}"))
+                    }
+            }).unwrap_or_else(|e| {
+                let err = cli_ser::ServerErr::Sending(format!("{}, because the thread pool execution failed, error {e:?}", err_msg(addr_to)));
+                tasks.send(Task::SendErr(addr_from, err.clone()))
+                    .unwrap_or_else(|e| error!("sending SendErr({addr_from}, {err:?}) to tasks failed, error {e}"))
+            });
         }
     }
     Ok(())

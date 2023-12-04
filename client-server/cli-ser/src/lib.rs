@@ -152,6 +152,12 @@ fn create_file_and_write_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io::Resu
     fs::File::create(path)?.write_all(bytes)
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ServerErr {
+    Receving(String),
+    Sending(String),
+}
+
 /// Messages to be sent over the network.
 ///
 /// TODO: Client can send Error message to the server which is confusing.
@@ -160,7 +166,7 @@ pub enum Message {
     Text(String),
     File(File),
     Image(Image),
-    Error(String),
+    ServerErr(ServerErr),
 }
 impl Message {
     /// Loads File from a path.

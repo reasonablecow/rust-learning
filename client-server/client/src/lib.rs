@@ -86,7 +86,7 @@ pub fn run() -> anyhow::Result<()> {
                             Err(e) => eprintln!("...saving the image failed! Err: {:?}", e),
                         }
                     }
-                    Message::Error(err_text) => eprintln!("received error: \"{}\"", err_text),
+                    Message::ServerErr(err) => eprintln!("received error: \"{err:?}\""),
                 }
             } else if recv_quit.try_recv().is_ok() {
                 break Ok(());
