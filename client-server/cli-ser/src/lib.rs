@@ -12,6 +12,7 @@ use std::{
 use chrono::{offset::Utc, SecondsFormat};
 use image::ImageFormat;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::Error::*;
 
@@ -64,7 +65,7 @@ pub enum ImageFormatDef {
     Qoi,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct Image {
     #[serde(with = "ImageFormatDef")]
     format: ImageFormat,
@@ -121,7 +122,7 @@ impl Image {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct File {
     name: OsString,
     bytes: Vec<u8>,
@@ -154,14 +155,14 @@ fn create_file_and_write_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io::Resu
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ServerErr {
-    Receving(String),
+    Receiving(String),
     Sending(String),
 }
 
 /// Messages to be sent over the network.
 ///
 /// TODO: Client can send Error message to the server which is confusing.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
     Text(String),
     File(File),
@@ -213,6 +214,11 @@ impl From<Image> for Message {
         Message::Image(value)
     }
 }
+impl From<ServerErr> for Message {
+    fn from(value: ServerErr) -> Message {
+        Message::ServerErr(value)
+    }
+}
 
 /// Tries to receive bytes (first asks for byte count) from given stream.
 ///
@@ -250,4 +256,17 @@ pub fn send_bytes(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
                 SendBytes(e)
             }
         })
+}
+
+pub async fn write_bytes(writer: &mut (impl AsyncWriteExt + std::marker::Unpin), bytes: &[u8]) -> Result<()> {
+    fn map_err(e: std::io::Error) -> Error {
+        if e.kind() == ErrorKind::BrokenPipe {
+            DisconnectedStream(e)
+        } else {
+            SendBytes(e)
+        }
+    }
+    let len = bytes.len();
+    writer.write_u32(len as u32).await.map_err(map_err)?;
+    writer.write_all(bytes).await.map_err(map_err)
 }
