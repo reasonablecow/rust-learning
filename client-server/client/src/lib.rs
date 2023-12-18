@@ -4,137 +4,147 @@
 //! ```sh
 //! cargo run -- --help
 //! ```
-use std::{fs, io, net::TcpStream, path::Path, sync::mpsc, thread, time::Duration};
+//!
+//! TODO: buffered
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, Context};
-use clap::Parser;
 use regex::Regex;
+use tokio::{
+    io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    select,
+    sync::oneshot::{self, Receiver, Sender},
+};
 
 use cli_ser::Message;
 
-/* // TODO: lazy statics for paths
-use once_cell::sync::Lazy;
-static FILES_DIR: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("files"));
-*/
-const HOST_DEFAULT: &str = "127.0.0.1"; // TODO - representation other than str
-const PORT_DEFAULT: u16 = 11111;
+pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
+pub const PORT_DEFAULT: u16 = 11111;
 
-/// Client executable, interactively sends messages to the specified server.
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Server host
-    #[arg(long, default_value_t = String::from(HOST_DEFAULT))]
-    host: String,
-
-    /// Server port
-    #[arg(short, long, default_value_t = PORT_DEFAULT)]
-    port: u16,
-
-    /// Save all images as PNG.
-    #[arg(short, long, default_value_t = false)]
-    save_png: bool,
+// Idea: maybe implement std Default for this...
+#[derive(Clone)]
+pub struct Client {
+    pub file_dir: PathBuf,
+    pub img_dir: PathBuf,
+    pub addr: SocketAddr,
+    pub save_png: bool,
 }
-
-/// Client's main function.
-///
-/// The main thread in a loop executes commands given by the user.
-/// Another thread is spawned in the background to receive messages from the server.
-pub fn run() -> anyhow::Result<()> {
-    let files_dir = Path::new("files");
-    let images_dir = Path::new("images");
-
-    let args = Args::parse();
-
-    fs::create_dir_all(files_dir).with_context(|| "Directory for files couldn't be created")?;
-    fs::create_dir_all(images_dir).with_context(|| "Directory for images couldn't be created")?;
-
-    let mut stream =
-        TcpStream::connect(format!("{}:{}", args.host, args.port)).with_context(|| {
+impl Client {
+    /// Client's main function.
+    ///
+    /// The main thread in a loop executes commands given by the user.
+    /// Another thread is spawned in the background to receive messages from the server.
+    pub async fn run(self) -> anyhow::Result<()> {
+        let socket = TcpStream::connect(self.addr).await.with_context(|| {
             "Connection to the server failed, please make sure the server is running."
         })?;
 
-    let mut stream_clone = stream
-        .try_clone()
-        .with_context(|| "Cloning of TcpStream for receiving messages failed")?;
+        let (reader, writer) = io::split(socket);
 
-    // Channel to indicate to stop waiting for messages.
-    let (send_quit, recv_quit) = mpsc::channel();
+        // Channel to indicate to stop waiting for messages.
+        let (send_quit, recv_quit) = oneshot::channel();
 
-    // Reads messages from the server in the background.
-    let receiver = thread::spawn(move || -> anyhow::Result<()> {
-        loop {
-            if let Some(msg) = Message::receive(&mut stream_clone)
-                .with_context(|| "reading bytes should never fail")?
-            {
-                match msg {
-                    Message::Text(text) => println!("{}", text),
-                    Message::File(f) => {
-                        println!("Received {:?}", f.name());
-                        f.save(files_dir).unwrap_or_else(|e| {
-                            eprintln!("...saving the file \"{:?}\" failed! Err: {:?}", f.name(), e)
-                        });
-                    }
-                    Message::Image(image) => {
-                        println!("Received image...");
-                        match if args.save_png {
-                            image.save_as_png(images_dir)
-                        } else {
-                            image.save(images_dir)
-                        } {
-                            Ok(path) => println!("...image was saved to {:?}", path),
-                            Err(e) => eprintln!("...saving the image failed! Err: {:?}", e),
-                        }
-                    }
-                    Message::ServerErr(err) => eprintln!("received error: \"{err:?}\""),
-                }
-            } else if recv_quit.try_recv().is_ok() {
-                break Ok(());
-            }
-        }
-    });
+        // Reads messages from the server in the background.
+        let receiver = tokio::spawn(self.clone().receive_in_loop(reader, recv_quit));
 
-    // Parses and executes commands given by the user.
-    loop {
-        if receiver.is_finished() {
-            break;
-        }
-        println!("Please type the command:");
-        let msg = match Command::from(
-            &*read_line_from_stdin().with_context(|| "reading your command failed")?,
-        ) {
-            Command::Quit => {
-                println!("Goodbye!");
-                // Time for messages which were sent but were not receivable yet.
-                thread::sleep(Duration::from_secs(5));
-                send_quit
-                    .send(())
-                    .with_context(|| "Sending a quit signal to the message receiver failed")?;
-                break;
-            }
-            cmd => Message::try_from(cmd)
-                .with_context(|| "Bug in a client code, contact the implementer")?,
-        };
-        msg.send(&mut stream)
-            .with_context(|| "sending your message to the server failed")?;
+        // Parses and executes commands given by the user.
+        Self::send_from_stdin(writer, send_quit).await?;
+
+        // Wait for the receiver to finish its job.
+        receiver
+            .await
+            // // thread::Error doesn't implement Sync -> can not be used with anyhow
+            // .expect("Message receiver crashed even though it never should, contact the implementer!")
+            .with_context(|| "Receiver went through an unrecoverable error")??;
+        println!("Good bye!");
+        Ok(())
     }
 
-    // Wait for the receiver to finish its job.
-    receiver
-        .join()
-        // thread::Error doesn't implement Sync -> can not be used with anyhow
-        .expect("Message receiver crashed even though it never should, contact the implementer!")
-        .with_context(|| "Receiver went through an unrecoverable error")?;
-    Ok(())
+    async fn receive_in_loop(
+        self,
+        mut socket: (impl AsyncReadExt + std::marker::Unpin),
+        mut recv_quit: Receiver<()>,
+    ) -> anyhow::Result<()> {
+        loop {
+            select!(
+                msg = Message::receive(&mut socket) => {
+                    self.process_msg(msg.with_context(|| "reading a message from server failed")?).await;
+                }
+                _ = &mut recv_quit => break Ok(()),
+            )
+        }
+    }
+
+    async fn process_msg(&self, msg: Message) {
+        match msg {
+            Message::Text(text) => println!("{}", text),
+            Message::File(f) => {
+                println!("Received {:?}", f.name());
+                f.save(&self.file_dir).unwrap_or_else(|e| {
+                    eprintln!("...saving the file \"{:?}\" failed! Err: {:?}", f.name(), e)
+                });
+            }
+            Message::Image(image) => {
+                println!("Received image...");
+                match if self.save_png {
+                    image.save_as_png(&self.img_dir)
+                } else {
+                    image.save(&self.img_dir)
+                } {
+                    Ok(path) => println!("...image was saved to {:?}", path),
+                    Err(e) => eprintln!("...saving the image failed! Err: {:?}", e),
+                }
+            }
+            Message::ServerErr(err) => eprintln!("received error: \"{err:?}\""),
+        };
+    }
+
+    ///
+    ///
+    /// The [tokio documentation](https://docs.rs/tokio_wasi/latest/tokio/io/fn.stdin.html)
+    /// says you should spawn a separate thread.
+    /// I had a problem to see it anywhere used like it, the
+    /// <https://google.github.io/comprehensive-rust/exercises/concurrency/chat-app.html>
+    /// uses BufReader.
+    async fn send_from_stdin(
+        mut socket: (impl AsyncWriteExt + std::marker::Unpin),
+        send_quit: Sender<()>,
+    ) -> anyhow::Result<()> {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        println!("Please type the command:");
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .with_context(|| "reading your command failed")?
+        {
+            let msg = match Command::from(&*line) {
+                Command::Quit => {
+                    println!("Logging out...");
+                    // Time for messages which were sent but were not receivable yet.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    send_quit.send(()).map_err(|_| {
+                        anyhow!("Sending a quit signal to the message receiver failed")
+                    })?;
+                    break;
+                }
+                cmd => Message::try_from(cmd)
+                    .with_context(|| "Bug in a client code, contact the implementer")?,
+            };
+            msg.send(&mut socket)
+                .await
+                .with_context(|| "sending your message to the server failed")?;
+        }
+        Ok(())
+    }
 }
 
 /// Reads line from standard input, strips ending newline if present.
-fn read_line_from_stdin() -> anyhow::Result<String> {
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .with_context(|| "reading a line from standard input failed")?;
-    Ok(line.strip_suffix('\n').map(str::to_string).unwrap_or(line))
+///
+/// todo: rewrite to strip_newline
+fn _strip_newline(line: String) -> String {
+    line.strip_suffix('\n').map(str::to_string).unwrap_or(line)
 }
 
 /// Commands useful for the client user.
@@ -214,15 +224,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_run() {
-        let listener = std::net::TcpListener::bind(format!("{}:{}", HOST_DEFAULT, PORT_DEFAULT))
+    /// TODO: the test doesn't work without a single keyboard press
+    #[tokio::test]
+    async fn test_run() {
+        let addr = SocketAddr::from((HOST_DEFAULT, PORT_DEFAULT));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
             .expect("TCP listener creation should not fail.");
-        let server_thread = thread::spawn(move || {
-            std::iter::from_fn(|| listener.incoming().next()).collect::<Vec<_>>()
+        let server_thread = tokio::spawn(async move {
+            let mut v: Vec<TcpStream> = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.expect("Accepting client failed!");
+                v.push(socket);
+            }
         });
-        let client_thread = thread::spawn(run);
-        thread::sleep(Duration::from_secs(1));
+        let client_thread = tokio::spawn(
+            Client {
+                img_dir: PathBuf::from("imgs"),
+                file_dir: PathBuf::from("fls"),
+                addr,
+                save_png: true,
+            }
+            .run(),
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!server_thread.is_finished());
         assert!(!client_thread.is_finished());
     }

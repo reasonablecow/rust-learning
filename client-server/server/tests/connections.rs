@@ -1,5 +1,6 @@
+use std::{net::TcpStream, time::Duration};
+
 use server::*;
-use std::{net::TcpStream, thread, time::Duration};
 
 #[tokio::test]
 async fn test_connections() {

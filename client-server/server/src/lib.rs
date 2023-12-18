@@ -12,7 +12,6 @@ use std::{net::SocketAddr, sync::Arc};
 use anyhow::Context;
 use dashmap::DashMap;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener,
@@ -22,7 +21,7 @@ use tokio::{
 use tracing::{error, info};
 
 use crate::Task::*;
-use cli_ser::{write_bytes, Message, ServerErr};
+use cli_ser::{write_bytes, Error::DisconnectedStream, Message, ServerErr};
 
 pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
 pub const PORT_DEFAULT: u16 = 11111;
@@ -32,7 +31,7 @@ pub fn address_default() -> SocketAddr {
 }
 
 /// Tasks to be initially queued at the server and addressed later.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Task {
     Broadcast(SocketAddr, Message),
     SendErr(SocketAddr, Message),
@@ -118,29 +117,20 @@ async fn client_listener(
 ///
 /// Panics when sending a task to `tasks` fails.
 async fn read_in_loop(addr: SocketAddr, tasks: Sender<Task>, mut reader: OwnedReadHalf) {
-    let tasks_broken_panic = "Emergency! Task queue stopped working!";
-    let e = loop {
-        let mut buf = match reader.read_u32().await {
-            Ok(len) => vec![0u8; len as usize],
-            Err(e) => break e,
-        };
-        if let Err(e) = reader.read_exact(&mut buf).await {
-            break e;
-        };
-        let task = match Message::deserialize(&buf) {
+    loop {
+        let task = match Message::receive(&mut reader).await {
             Ok(msg) => Broadcast(addr, msg),
-            Err(_) => SendErr(
-                addr,
-                Message::from(ServerErr::Receiving("Message decoding failed!".to_string())),
-            ),
+            Err(DisconnectedStream(_)) => CloseStream(addr),
+            Err(e) => SendErr(addr, Message::from(ServerErr::Receiving(format!("{e:?}")))),
         };
-        tasks.send(task).await.expect(tasks_broken_panic);
-    };
-    error!("Reading messages of {addr} failed! Error: {e:?}");
-    tasks
-        .send(CloseStream(addr))
-        .await
-        .expect(tasks_broken_panic);
+        tasks
+            .send(task.clone())
+            .await
+            .expect("Emergency! Task queue stopped working!");
+        if let CloseStream(_) = task {
+            break;
+        }
+    }
 }
 
 /// Writes every coming message from `messages` into `writer`.

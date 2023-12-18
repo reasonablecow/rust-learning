@@ -4,7 +4,6 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::{self, Cursor, ErrorKind, Read, Write},
-    net::TcpStream,
     path::{Path, PathBuf},
     result,
 };
@@ -191,17 +190,14 @@ impl Message {
     }
 
     /// Tries to receive a message from the given stream.
-    pub fn receive(stream: &mut TcpStream) -> Result<Option<Self>> {
-        receive_bytes(stream)?
-            .as_deref()
-            .map(Self::deserialize)
-            .transpose()
+    pub async fn receive(stream: &mut (impl AsyncReadExt + std::marker::Unpin)) -> Result<Self> {
+        Self::deserialize(&read_bytes(stream).await?)
     }
 
     /// Sends a message over the given stream.
-    pub fn send(&self, stream: &mut TcpStream) -> Result<()> {
-        self.serialize()
-            .and_then(|bytes| send_bytes(stream, &bytes))
+    pub async fn send(&self, socket: &mut (impl AsyncWriteExt + std::marker::Unpin)) -> Result<()> {
+        let bytes = self.serialize()?;
+        write_bytes(socket, &bytes).await // TODO
     }
 }
 impl From<File> for Message {
@@ -220,53 +216,38 @@ impl From<ServerErr> for Message {
     }
 }
 
-/// Tries to receive bytes (first asks for byte count) from given stream.
-///
-/// Asks for the byte count in a non-blocking manner; upon success, the byte reading becomes blocking.
-pub fn receive_bytes(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
-    stream.set_nonblocking(true).map_err(ReceiveBytes)?;
-    let mut len_bytes = [0u8; 4];
-    match stream.read_exact(&mut len_bytes) {
-        Ok(()) => stream
-            .set_nonblocking(false)
-            .and_then(|_| {
-                let len = u32::from_be_bytes(len_bytes) as usize;
-                let mut bytes = vec![0u8; len];
-                stream.read_exact(&mut bytes).map(|_| Some(bytes))
-            })
-            .map_err(ReceiveBytes),
-        Err(e) => match e.kind() {
-            ErrorKind::WouldBlock => Ok(None), // No message is ready
-            ErrorKind::UnexpectedEof => Err(DisconnectedStream(e)),
-            _ => Err(ReceiveBytes(e)),
-        },
+pub async fn read_bytes(stream: &mut (impl AsyncReadExt + std::marker::Unpin)) -> Result<Vec<u8>> {
+    fn map_err(e: io::Error) -> Error {
+        if e.kind() == ErrorKind::UnexpectedEof {
+            DisconnectedStream(e)
+        } else {
+            ReceiveBytes(e)
+        }
     }
+    let len = stream.read_u32().await.map_err(map_err)?;
+    let mut bytes = vec![0u8; len as usize];
+    stream.read_exact(&mut bytes).await.map_err(map_err)?;
+    Ok(bytes)
 }
 
-/// Tries to send bytes over given stream.
-pub fn send_bytes(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
-    stream
-        .write_all(&((bytes.len() as u32).to_be_bytes()))
-        .and_then(|_| stream.write_all(bytes))
-        .and_then(|_| stream.flush())
-        .map_err(|e| {
-            if e.kind() == ErrorKind::BrokenPipe {
-                DisconnectedStream(e)
-            } else {
-                SendBytes(e)
-            }
-        })
-}
-
-pub async fn write_bytes(writer: &mut (impl AsyncWriteExt + std::marker::Unpin), bytes: &[u8]) -> Result<()> {
-    fn map_err(e: std::io::Error) -> Error {
+/// todo: tried to use future.and_then, but the writer was borrowed multiple times...
+pub async fn write_bytes(
+    writer: &mut (impl AsyncWriteExt + std::marker::Unpin),
+    bytes: &[u8],
+) -> Result<()> {
+    fn map_err(e: io::Error) -> Error {
         if e.kind() == ErrorKind::BrokenPipe {
             DisconnectedStream(e)
         } else {
             SendBytes(e)
         }
     }
-    let len = bytes.len();
-    writer.write_u32(len as u32).await.map_err(map_err)?;
-    writer.write_all(bytes).await.map_err(map_err)
+
+    writer
+        .write_u32(bytes.len() as u32)
+        .await
+        .map_err(map_err)?;
+    writer.write_all(bytes).await.map_err(map_err)?;
+    writer.flush().await.map_err(map_err)?;
+    Ok(())
 }

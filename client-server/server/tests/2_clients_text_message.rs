@@ -1,18 +1,23 @@
+use std::time::Duration;
+
 use cli_ser::Message;
+use tokio::net::TcpStream;
+
 use server::*;
-use std::{net::TcpStream, time::Duration};
 
 async fn client(s: &str) -> Message {
-    let mut stream =
-        TcpStream::connect(address_default()).expect("connecting to the server should succeed");
+    let mut stream = TcpStream::connect(address_default())
+        .await
+        .expect("connecting to the server should succeed");
     tokio::time::sleep(Duration::from_millis(100)).await; // wait for client connections
     Message::Text(s.to_string())
         .send(&mut stream)
+        .await
         .expect("sending of bytes should succeed");
     tokio::time::sleep(Duration::from_millis(100)).await; // wait for messages to be sent
     Message::receive(&mut stream)
+        .await
         .expect("receiving of a message should succeed")
-        .expect("message should not be None")
 }
 
 fn msg_to_string(m: Message) -> String {
