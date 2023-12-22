@@ -8,6 +8,7 @@ use std::{
     result,
 };
 
+use async_trait::async_trait;
 use chrono::{offset::Utc, SecondsFormat};
 use image::ImageFormat;
 use serde::{Deserialize, Serialize};
@@ -152,67 +153,100 @@ fn create_file_and_write_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io::Resu
     fs::File::create(path)?.write_all(bytes)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum ServerErr {
     Receiving(String),
     Sending(String),
 }
 
-/// Messages to be sent over the network.
-///
-/// TODO: Client can send Error message to the server which is confusing.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum Message {
+/// Data to be sent over the network.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum Data {
     Text(String),
     File(File),
     Image(Image),
-    ServerErr(ServerErr),
 }
-impl Message {
-    /// Loads File from a path.
-    pub fn file_from_path(path: impl AsRef<Path>) -> Result<Self> {
-        File::from_path(path).map(Message::from)
+impl From<File> for Data {
+    fn from(value: File) -> Data {
+        Data::File(value)
     }
-
-    /// Loads Image from a path.
-    pub fn img_from_path(path: impl AsRef<Path>) -> Result<Self> {
-        Image::from_path(path).map(Message::from)
+}
+impl From<Image> for Data {
+    fn from(value: Image) -> Data {
+        Data::Image(value)
     }
+}
 
+pub mod cli {
+    use crate::*;
+    use std::path::Path;
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    pub enum Msg {
+        Auth { username: String, password: String },
+        Data(Data),
+    }
+    impl Msg {
+        /// Loads File from a path.
+        pub fn file_from_path(path: impl AsRef<Path>) -> Result<Self> {
+            File::from_path(path).map(Data::from).map(Self::Data)
+        }
+
+        /// Loads Image from a path.
+        pub fn img_from_path(path: impl AsRef<Path>) -> Result<Self> {
+            Image::from_path(path).map(Data::from).map(Self::Data)
+        }
+    }
+    impl Messageable for Msg {}
+}
+
+pub mod ser {
+    use crate::*;
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    pub enum Msg {
+        Info(String),
+        Error(ServerErr),
+        DataFrom { data: crate::Data, from: String },
+    }
+    impl From<ServerErr> for Msg {
+        fn from(value: ServerErr) -> Self {
+            Msg::Error(value)
+        }
+    }
+    impl Messageable for Msg {}
+}
+
+#[async_trait]
+pub trait Messageable
+where
+    Self: serde::ser::Serialize,
+    for<'de> Self: serde::de::Deserialize<'de>,
+{
     /// Serializes Message into bytes.
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    fn to_bytes(&self) -> Result<Vec<u8>> {
         bincode::serialize(self).map_err(SerializeMsg)
     }
 
     /// Deserialize Message from bytes.
-    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
         bincode::deserialize(bytes).map_err(DeserializeMsg)
     }
 
     /// Tries to receive a message from the given stream.
-    pub async fn receive(stream: &mut (impl AsyncReadExt + std::marker::Unpin)) -> Result<Self> {
-        Self::deserialize(&read_bytes(stream).await?)
+    async fn receive<S>(stream: &mut S) -> Result<Self>
+    where
+        S: AsyncReadExt + std::marker::Unpin + std::marker::Send,
+    {
+        Self::from_bytes(&read_bytes(stream).await?)
     }
 
     /// Sends a message over the given stream.
-    pub async fn send(&self, socket: &mut (impl AsyncWriteExt + std::marker::Unpin)) -> Result<()> {
-        let bytes = self.serialize()?;
-        write_bytes(socket, &bytes).await // TODO
-    }
-}
-impl From<File> for Message {
-    fn from(value: File) -> Message {
-        Message::File(value)
-    }
-}
-impl From<Image> for Message {
-    fn from(value: Image) -> Message {
-        Message::Image(value)
-    }
-}
-impl From<ServerErr> for Message {
-    fn from(value: ServerErr) -> Message {
-        Message::ServerErr(value)
+    async fn send<S>(&self, socket: &mut S) -> Result<()>
+    where
+        S: AsyncWriteExt + std::marker::Unpin + std::marker::Send,
+    {
+        write_bytes(socket, &self.to_bytes()?).await
     }
 }
 

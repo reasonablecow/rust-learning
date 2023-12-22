@@ -17,7 +17,7 @@ use tokio::{
     sync::oneshot::{self, Receiver, Sender},
 };
 
-use cli_ser::Message;
+use cli_ser::{cli, ser, Data, Messageable};
 
 pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
 pub const PORT_DEFAULT: u16 = 11111;
@@ -61,14 +61,17 @@ impl Client {
         Ok(())
     }
 
-    async fn receive_in_loop(
+    async fn receive_in_loop<S>(
         self,
-        mut socket: (impl AsyncReadExt + std::marker::Unpin),
+        mut socket: S,
         mut recv_quit: Receiver<()>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncReadExt + std::marker::Unpin + std::marker::Send,
+    {
         loop {
             select!(
-                msg = Message::receive(&mut socket) => {
+                msg = ser::Msg::receive(&mut socket) => {
                     self.process_msg(msg.with_context(|| "reading a message from server failed")?).await;
                 }
                 _ = &mut recv_quit => break Ok(()),
@@ -76,17 +79,26 @@ impl Client {
         }
     }
 
-    async fn process_msg(&self, msg: Message) {
+    async fn process_msg(&self, msg: ser::Msg) {
         match msg {
-            Message::Text(text) => println!("{}", text),
-            Message::File(f) => {
-                println!("Received {:?}", f.name());
+            ser::Msg::DataFrom {
+                data: Data::Text(text),
+                from,
+            } => println!("{from}: {text}"),
+            ser::Msg::DataFrom {
+                data: Data::File(f),
+                from,
+            } => {
+                println!("Received {:?} from {from}", f.name());
                 f.save(&self.file_dir).unwrap_or_else(|e| {
                     eprintln!("...saving the file \"{:?}\" failed! Err: {:?}", f.name(), e)
                 });
             }
-            Message::Image(image) => {
-                println!("Received image...");
+            ser::Msg::DataFrom {
+                data: Data::Image(image),
+                from,
+            } => {
+                println!("Received image from {from}...");
                 match if self.save_png {
                     image.save_as_png(&self.img_dir)
                 } else {
@@ -96,7 +108,8 @@ impl Client {
                     Err(e) => eprintln!("...saving the image failed! Err: {:?}", e),
                 }
             }
-            Message::ServerErr(err) => eprintln!("received error: \"{err:?}\""),
+            ser::Msg::Info(text) => println!("{text}"),
+            ser::Msg::Error(err) => eprintln!("received error: \"{err:?}\""),
         };
     }
 
@@ -107,20 +120,22 @@ impl Client {
     /// I had a problem to see it anywhere used like it, the
     /// <https://google.github.io/comprehensive-rust/exercises/concurrency/chat-app.html>
     /// uses BufReader.
-    async fn send_from_stdin(
-        mut socket: (impl AsyncWriteExt + std::marker::Unpin),
-        send_quit: Sender<()>,
-    ) -> anyhow::Result<()> {
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        println!("Please type the command:");
+    ///
+    /// TODO <https://docs.rs/tokio/latest/tokio/io/struct.Stdin.html>
+    /// For technical reasons, stdin is implemented by using an ordinary blocking read on a separate thread, and it is impossible to cancel that read. This can make shutdown of the runtime hang until the user presses enter.
+    async fn send_from_stdin<S>(mut socket: S, send_quit: Sender<()>) -> anyhow::Result<()>
+    where
+        S: AsyncWriteExt + std::marker::Unpin + std::marker::Send,
+    {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines(); // TODO
 
         while let Some(line) = lines
             .next_line()
             .await
             .with_context(|| "reading your command failed")?
         {
-            let msg = match Command::from(&*line) {
-                Command::Quit => {
+            match Command::try_from(&*line) {
+                Ok(Command::Quit) => {
                     println!("Logging out...");
                     // Time for messages which were sent but were not receivable yet.
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -129,12 +144,12 @@ impl Client {
                     })?;
                     break;
                 }
-                cmd => Message::try_from(cmd)
-                    .with_context(|| "Bug in a client code, contact the implementer")?,
+                Ok(Command::Msg(msg)) => msg
+                    .send(&mut socket)
+                    .await
+                    .with_context(|| "sending your message to the server failed")?,
+                Err(e) => eprintln!("Couldn't create your message (error: {e:?})"),
             };
-            msg.send(&mut socket)
-                .await
-                .with_context(|| "sending your message to the server failed")?;
         }
         Ok(())
     }
@@ -151,76 +166,78 @@ fn _strip_newline(line: String) -> String {
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Quit,
-    File(String),
-    Image(String),
-    Other(String),
+    Msg(cli::Msg),
 }
 /// Converts the first line of the borrowed str to Command, rest is ignored.
-impl From<&str> for Command {
-    fn from(value: &str) -> Self {
+impl TryFrom<&str> for Command {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
         let err_msg = "unexpected regex error, contact the crate implementer";
         let reg_quit = Regex::new(r"^\s*\.quit\s*$").expect(err_msg);
         let reg_file = Regex::new(r"^\s*\.file\s+(?<file>\S+.*)\s*$").expect(err_msg);
         let reg_image = Regex::new(r"^\s*\.image\s+(?<image>\S+.*)\s*$").expect(err_msg);
+        let reg_auth =
+            Regex::new(r"^\s*\.login\s+(?<name>\S+.*)\s+(?<pswd>\S+.*)\s*$").expect(err_msg);
 
-        if reg_quit.is_match(value) {
+        let cmd = if reg_quit.is_match(value) {
             Command::Quit
         } else if let Some((_, [file])) = reg_file.captures(value).map(|caps| caps.extract()) {
-            Command::File(file.to_string())
+            Command::Msg(cli::Msg::file_from_path(file)?)
         } else if let Some((_, [image])) = reg_image.captures(value).map(|caps| caps.extract()) {
-            Command::Image(image.to_string())
+            Command::Msg(cli::Msg::img_from_path(image)?)
+        } else if let Some((_, [name, pswd])) = reg_auth.captures(value).map(|caps| caps.extract())
+        {
+            Command::Msg(cli::Msg::Auth {
+                username: name.to_string(),
+                password: pswd.to_string(),
+            })
         } else {
-            Command::Other(value.to_string())
-        }
-    }
-}
-impl TryFrom<Command> for Message {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Command) -> Result<Self, <cli_ser::Message as TryFrom<Command>>::Error> {
-        match value {
-            Command::Quit => Err(anyhow!(
-                "A Massage can not be constructed from a Quit command!"
-            )),
-            Command::Other(s) => Ok(Message::Text(s)),
-            Command::File(path) => Ok(Message::file_from_path(path)?),
-            Command::Image(path) => Ok(Message::img_from_path(path)?),
-        }
+            Command::Msg(cli::Msg::Data(Data::Text(value.to_string())))
+        };
+        Ok(cmd)
     }
 }
 
+// TODO
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn command_from_str_quit() {
-        assert_eq!(Command::Quit, Command::from(".quit"));
-        assert_eq!(Command::Quit, Command::from("      .quit      "));
+        assert_eq!(Command::Quit, Command::try_from(".quit").unwrap());
+        assert_eq!(
+            Command::Quit,
+            Command::try_from("      .quit      ").unwrap()
+        );
     }
 
     #[test]
     fn command_from_str_file() {
-        let f = "a.txt";
+        let path = "Cargo.toml";
         assert_eq!(
-            Command::File(String::from(f)),
-            Command::from(&*format!(".file {}", f))
+            Command::Msg(cli::Msg::file_from_path(path).unwrap()),
+            Command::try_from(&*format!(".file {path}")).unwrap()
         );
     }
 
     #[test]
     fn command_from_str_image() {
-        let i = "i.png";
+        let path = "../example-images/rustacean-orig-noshadow.png";
         assert_eq!(
-            Command::Image(String::from(i)),
-            Command::from(&*format!(".image {}", i))
+            Command::Msg(cli::Msg::img_from_path(path).unwrap()),
+            Command::try_from(&*format!(".image {path}")).unwrap()
         );
     }
 
     #[test]
     fn command_from_str_other() {
         for s in [". quit", ".quit      s", "a   .quit "] {
-            assert_eq!(Command::Other(String::from(s)), Command::from(s));
+            assert_eq!(
+                Command::Msg(cli::Msg::Data(Data::Text(s.to_string()))),
+                Command::try_from(s).unwrap()
+            );
         }
     }
 

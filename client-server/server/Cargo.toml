@@ -11,6 +11,7 @@ chrono = "0.4.31"
 clap = { version = "4.4.8", features = ["derive"] }
 cli-ser = { path = "../cli-ser" }
 dashmap = "5.5.3"
+sqlx = { version = "0.7.3", features = [ "runtime-tokio-rustls", "postgres", "macros" ] }
 tokio = { version = "1.35.0", features = ["full"] }
 tracing = "0.1.40"
 tracing-appender = "0.2.3"
