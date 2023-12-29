@@ -26,5 +26,6 @@ impl Args {
 async fn main() -> anyhow::Result<()> {
     let address = Args::parse_to_address()?;
     let _log_file_guard = server::init_logging_stdout_and_file()?;
-    server::run(address).await
+    let server = server::Server::build(address).await?;
+    server.run().await
 }

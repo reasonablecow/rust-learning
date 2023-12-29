@@ -13,8 +13,8 @@ async fn connect() -> TcpStream {
         panic!()
     };
     (cli::Msg::Auth {
-        username: "test".to_string(),
-        password: "testtest".to_string(),
+        username: "test_user".to_string(),
+        password: "test_pass".to_string(),
     })
     .send(&mut conn)
     .await
@@ -46,7 +46,8 @@ async fn recv(socket: &mut TcpStream) -> String {
 
 #[tokio::test]
 async fn test_5_clients_5_messages() {
-    let server_thread = tokio::spawn(run(address_default()));
+    let server = server::Server::build(address_default()).await.unwrap();
+    let server_thread = tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Connection of client_1, client_2, client_3
