@@ -25,6 +25,10 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use chrono::{offset::Utc, SecondsFormat};
 use dashmap::DashMap;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -206,6 +210,7 @@ async fn authenticate(
     writer: &mut OwnedWriteHalf,
     pool: Arc<Mutex<PgPool>>,
 ) -> anyhow::Result<()> {
+    let argon2 = Argon2::default();
     ser::Msg::Info("Please log in with existing user or create a new one.".to_string())
         .send(writer)
         .await?;
@@ -220,8 +225,13 @@ async fn authenticate(
                     .with_context(|| "Querying the database for authentication failed.")?
                 {
                     Some(user) => {
-                        // TODO - https://docs.rs/argon2/latest/argon2/
-                        if password == user.password {
+                        if argon2
+                            .verify_password(
+                                password.as_bytes(),
+                                &PasswordHash::new(&user.password)?,
+                            )
+                            .is_ok()
+                        {
                             ser::Msg::Info(format!(
                                 "Hi {}, logging in was successful!",
                                 user.username
@@ -238,9 +248,12 @@ async fn authenticate(
                         .await?;
                     }
                     None => {
+                        let password = argon2
+                            .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))?
+                            .to_string();
                         sqlx::query("INSERT INTO users (username, password) VALUES ($1, $2);")
                             .bind(username.clone())
-                            .bind(password.clone()) // TODO
+                            .bind(password)
                             .execute(&*pool)
                             .await?;
                         ser::Msg::Info(format!("Welcome {username}, your account was created!"))

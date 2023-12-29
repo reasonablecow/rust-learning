@@ -17,7 +17,7 @@ async fn client(s: &str) -> Data {
         .expect("sending Auth failed");
 
     // wait for the other client to connect
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     cli::Msg::Data(Data::Text(s.to_string()))
         .send(&mut stream)
