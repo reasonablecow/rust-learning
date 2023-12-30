@@ -11,5 +11,7 @@ async fn test_connections() {
         .map(|_| TcpStream::connect(address_default()).unwrap())
         .collect();
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(!server_thread.is_finished());
+    if server_thread.is_finished() {
+        server_thread.await.unwrap().unwrap();
+    }
 }

@@ -153,12 +153,6 @@ fn create_file_and_write_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io::Resu
     fs::File::create(path)?.write_all(bytes)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub enum ServerErr {
-    Receiving(String),
-    Sending(String),
-}
-
 /// Data to be sent over the network.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Data {
@@ -182,8 +176,20 @@ pub mod cli {
     use std::path::Path;
 
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    pub struct User {
+        pub username: String,
+        pub password: String,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    pub enum Auth {
+        LogIn(User),
+        SignUp(User),
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
     pub enum Msg {
-        Auth { username: String, password: String },
+        Auth(Auth),
         Data(Data),
     }
     impl Msg {
@@ -203,14 +209,24 @@ pub mod cli {
 pub mod ser {
     use crate::*;
 
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    pub enum Error {
+        Receiving(String),
+        Sending(String),
+        NotAuthenticated(cli::Msg),
+        WrongUser,
+        WrongPassword,
+        UsernameTaken,
+    }
+
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
     pub enum Msg {
-        Info(String),
-        Error(ServerErr),
+        Authenticated,
+        Error(Error),
         DataFrom { data: crate::Data, from: String },
     }
-    impl From<ServerErr> for Msg {
-        fn from(value: ServerErr) -> Self {
+    impl From<Error> for Msg {
+        fn from(value: Error) -> Self {
             Msg::Error(value)
         }
     }

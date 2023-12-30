@@ -1,28 +1,22 @@
 use std::time::Duration;
 
-use cli_ser::{cli, ser, Data, Messageable};
+use cli_ser::{
+    cli::{self, Auth::LogIn, Auth::SignUp, Msg::Auth, User},
+    ser, Data, Messageable,
+};
 use tokio::net::TcpStream;
 
 use server::*;
 
-async fn connect() -> TcpStream {
+async fn connect(user: User) -> TcpStream {
     let mut conn = TcpStream::connect(address_default())
         .await
         .expect("connecting to the server should succeed");
-    let ser::Msg::Info(_) = ser::Msg::receive(&mut conn).await.unwrap() else {
-        panic!()
-    };
-    (cli::Msg::Auth {
-        username: "test_user".to_string(),
-        password: "test_pass".to_string(),
-    })
-    .send(&mut conn)
-    .await
-    .unwrap();
-    let ser::Msg::Info(_) = ser::Msg::receive(&mut conn).await.unwrap() else {
-        panic!()
-    };
-    conn
+    Auth(LogIn(user)).send(&mut conn).await.unwrap();
+    match ser::Msg::receive(&mut conn).await.unwrap() {
+        ser::Msg::Authenticated => conn,
+        other => panic!("{other:?}"),
+    }
 }
 
 async fn send(socket: &mut TcpStream, s: &str) {
@@ -33,15 +27,13 @@ async fn send(socket: &mut TcpStream, s: &str) {
 }
 
 async fn recv(socket: &mut TcpStream) -> String {
-    let ser::Msg::DataFrom {
-        data: Data::Text(s),
-        ..
-    } = ser::Msg::receive(socket).await.unwrap()
-    else {
-        panic!()
-    };
-
-    s.to_string()
+    match ser::Msg::receive(socket).await.unwrap() {
+        ser::Msg::DataFrom {
+            data: Data::Text(s),
+            ..
+        } => s.to_string(),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -50,10 +42,23 @@ async fn test_5_clients_5_messages() {
     let server_thread = tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    let user = User {
+        username: "test_user".to_string(),
+        password: "test_pass".to_string(),
+    };
+    {
+        let mut stream = TcpStream::connect(address_default()).await.unwrap();
+        Auth(SignUp(user.clone())).send(&mut stream).await.unwrap();
+        match ser::Msg::receive(&mut stream).await.unwrap() {
+            ser::Msg::Authenticated | ser::Msg::Error(ser::Error::UsernameTaken) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
     // Connection of client_1, client_2, client_3
-    let mut client_1 = connect().await;
-    let mut client_2 = connect().await;
-    let mut client_3 = connect().await;
+    let mut client_1 = connect(user.clone()).await;
+    let mut client_2 = connect(user.clone()).await;
+    let mut client_3 = connect(user.clone()).await;
 
     // client_3 sends a message to client_1, client_2 (SEND AFTER CONNECTION)
     let msg_1 = "#1 from 3";
@@ -71,7 +76,7 @@ async fn test_5_clients_5_messages() {
     // tokio::time::sleep(Duration::from_secs(1)).await; // Wait for client_1 to receive it
 
     // Connection of client_4
-    let client_4 = connect().await;
+    let client_4 = connect(user.clone()).await;
 
     // client_1 sends a message to client_3, client_4 (MESSAGE FROM OTHER CLIENT)
     let msg_3 = "#3 from 1";
@@ -89,7 +94,7 @@ async fn test_5_clients_5_messages() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connection of client_5
-    let client_5 = connect().await;
+    let client_5 = connect(user.clone()).await;
     // Wait for all messages to arrive.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -112,5 +117,7 @@ async fn test_5_clients_5_messages() {
         .await;
         assert_eq!(collected, msgs);
     }
-    assert!(!server_thread.is_finished());
+    if server_thread.is_finished() {
+        server_thread.await.unwrap().unwrap();
+    }
 }

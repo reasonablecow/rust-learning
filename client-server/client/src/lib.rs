@@ -69,6 +69,7 @@ impl Client {
     where
         S: AsyncReadExt + std::marker::Unpin + std::marker::Send,
     {
+        println!("Please .login with user and password or .signup to create a new one.");
         loop {
             select!(
                 msg = ser::Msg::receive(&mut socket) => {
@@ -108,12 +109,12 @@ impl Client {
                     Err(e) => eprintln!("...saving the image failed! Err: {:?}", e),
                 }
             }
-            ser::Msg::Info(text) => println!("{text}"),
-            ser::Msg::Error(err) => eprintln!("received error: \"{err:?}\""),
+            ser::Msg::Authenticated => println!("Welcome!"),
+            ser::Msg::Error(err) => eprintln!("Error: \"{err:?}\""),
         };
     }
 
-    ///
+    /// Reads commands from standard input, sends messages to the server.
     ///
     /// The [tokio documentation](https://docs.rs/tokio_wasi/latest/tokio/io/fn.stdin.html)
     /// says you should spawn a separate thread.
@@ -123,6 +124,9 @@ impl Client {
     ///
     /// TODO <https://docs.rs/tokio/latest/tokio/io/struct.Stdin.html>
     /// For technical reasons, stdin is implemented by using an ordinary blocking read on a separate thread, and it is impossible to cancel that read. This can make shutdown of the runtime hang until the user presses enter.
+    ///
+    /// TODO: use thread::spawn and tokio channel.
+    /// <https://www.reddit.com/r/rust/comments/ovxrd6/help_needed_reading_user_input_with_tokio/>
     async fn send_from_stdin<S>(mut socket: S, send_quit: Sender<()>) -> anyhow::Result<()>
     where
         S: AsyncWriteExt + std::marker::Unpin + std::marker::Send,
@@ -177,8 +181,10 @@ impl TryFrom<&str> for Command {
         let reg_quit = Regex::new(r"^\s*\.quit\s*$").expect(err_msg);
         let reg_file = Regex::new(r"^\s*\.file\s+(?<file>\S+.*)\s*$").expect(err_msg);
         let reg_image = Regex::new(r"^\s*\.image\s+(?<image>\S+.*)\s*$").expect(err_msg);
-        let reg_auth =
+        let reg_log_in =
             Regex::new(r"^\s*\.login\s+(?<name>\S+.*)\s+(?<pswd>\S+.*)\s*$").expect(err_msg);
+        let reg_sign_up =
+            Regex::new(r"^\s*\.signup\s+(?<name>\S+.*)\s+(?<pswd>\S+.*)\s*$").expect(err_msg);
 
         let cmd = if reg_quit.is_match(value) {
             Command::Quit
@@ -186,12 +192,20 @@ impl TryFrom<&str> for Command {
             Command::Msg(cli::Msg::file_from_path(file)?)
         } else if let Some((_, [image])) = reg_image.captures(value).map(|caps| caps.extract()) {
             Command::Msg(cli::Msg::img_from_path(image)?)
-        } else if let Some((_, [name, pswd])) = reg_auth.captures(value).map(|caps| caps.extract())
+        } else if let Some((_, [name, pswd])) =
+            reg_log_in.captures(value).map(|caps| caps.extract())
         {
-            Command::Msg(cli::Msg::Auth {
+            Command::Msg(cli::Msg::Auth(cli::Auth::LogIn(cli::User {
                 username: name.to_string(),
                 password: pswd.to_string(),
-            })
+            })))
+        } else if let Some((_, [name, pswd])) =
+            reg_sign_up.captures(value).map(|caps| caps.extract())
+        {
+            Command::Msg(cli::Msg::Auth(cli::Auth::SignUp(cli::User {
+                username: name.to_string(),
+                password: pswd.to_string(),
+            })))
         } else {
             Command::Msg(cli::Msg::Data(Data::Text(value.to_string())))
         };

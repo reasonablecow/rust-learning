@@ -2,46 +2,26 @@
 //!
 //! Listens at a specified address and broadcasts every received message to all other connected clients.
 //!
-//! In order to set up the postgres database you can use:
-//! ```sh
-//! sudo docker run -p 5432:5432 --name pg -e POSTGRES_PASSWORD=pp -d postgres
-//! ```
+//! You need to set up a database first, see [db].
 //!
-//! See:
+//! For options run:
 //! ```sh
 //! cargo run -- --help
 //! ```
 //!
-//! TODO: Move database to separate file
-//! TODO: During an authentication, there can not be pause between
-//! select from users and insert into users,
-//! otherwise two users with the same name can be created at the same time.
-//! TODO: std mutex is preferred over tokio mutex, but pool.query needs .await
-//! "The primary use case for the async mutex is to provide shared mutable access to IO resources such as a database connection."
-//! -- <https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html>
-//! possiblility to refactor the database with actor model.
 //! TODO: Test client disconnection.
-//! TODO: Handle listener task.
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
 use chrono::{offset::Utc, SecondsFormat};
 use dashmap::DashMap;
-use sqlx::postgres::{PgPool, PgPoolOptions};
 use tokio::{
     join,
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Mutex,
-    },
+    sync::mpsc::{self, Receiver, Sender},
 };
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -50,12 +30,13 @@ use tracing_subscriber::{
     Layer,
 };
 
+mod db;
+
 use crate::Task::*;
-use cli_ser::{cli, ser, Data, Error::DisconnectedStream, Messageable, ServerErr};
+use cli_ser::{cli, ser, Data, Error::DisconnectedStream, Messageable};
 
 pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
 pub const PORT_DEFAULT: u16 = 11111;
-const CONN_STR: &str = "postgres://postgres:pp@localhost:5432/postgres";
 
 pub fn address_default() -> SocketAddr {
     SocketAddr::from((HOST_DEFAULT, PORT_DEFAULT))
@@ -65,51 +46,28 @@ pub fn address_default() -> SocketAddr {
 #[derive(Debug, Clone)]
 enum Task {
     Broadcast(SocketAddr, Data),
-    SendErr(SocketAddr, ServerErr),
+    SendErr(SocketAddr, ser::Error),
     CloseStream(SocketAddr),
 }
 
 enum DataOrErr {
     Data { from: SocketAddr, data: Data },
-    Err(ServerErr),
+    Err(ser::Error),
 }
 
 /// Channels to tasks which writes to specified Address over TCP.
 type Senders = DashMap<SocketAddr, Sender<DataOrErr>>;
 
-#[derive(Debug, sqlx::FromRow)]
-struct User {
-    username: String,
-    password: String,
-}
-
-const CREATE_USERS: &str = r#"
-CREATE TABLE IF NOT EXISTS "users" (
-  "id" bigserial PRIMARY KEY,
-  "username" text NOT NULL,
-  "password" text NOT NULL
-);
-"#;
-
-async fn init_database() -> anyhow::Result<PgPool> {
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(CONN_STR)
-        .await?;
-    sqlx::query(CREATE_USERS).execute(&pool).await?;
-    Ok(pool)
-}
-
 pub struct Server {
     address: SocketAddr,
-    pool: Arc<Mutex<PgPool>>,
+    db: Arc<db::Database>,
 }
 impl Server {
     /// Builds the server, especially database initialization, takes time."
     pub async fn build(address: impl Into<SocketAddr>) -> anyhow::Result<Self> {
         let address = address.into();
-        let pool = Arc::new(Mutex::new(init_database().await?));
-        Ok(Server { address, pool })
+        let db = Arc::new(db::Database::try_new().await?);
+        Ok(Server { address, db })
     }
 
     /// Runs the server, connections should be accepted immediately.
@@ -124,9 +82,10 @@ impl Server {
 /// In the main loop, the server processes tasks one at a time from its queue.
 /// The server is written as if it should run forever.
 async fn run(server: Server) -> anyhow::Result<()> {
+    let Server { address, db } = server;
     let (task_producer, mut task_consumer) = mpsc::channel(1024);
     let clients: Arc<Senders> = Arc::new(DashMap::new());
-    let _listener = tokio::spawn(client_listener(server, task_producer, clients.clone()));
+    let listener = tokio::spawn(client_listener(address, task_producer, clients.clone(), db));
     while let Some(task) = task_consumer.recv().await {
         match task {
             Broadcast(addr_from, msg) => {
@@ -154,15 +113,15 @@ async fn run(server: Server) -> anyhow::Result<()> {
             }
         }
     }
-    Ok(())
+    listener.await?
 }
 
 async fn client_listener(
-    server: Server,
+    address: SocketAddr,
     tasks: Sender<Task>,
     clients: Arc<Senders>,
+    db: Arc<db::Database>,
 ) -> anyhow::Result<()> {
-    let (address, pool) = (server.address, server.pool);
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("Listening at {address:?} failed."))?;
@@ -176,7 +135,7 @@ async fn client_listener(
                     tasks.clone(),
                     socket,
                     clients.clone(),
-                    pool.clone(),
+                    db.clone(),
                 ));
             }
             Err(e) => error!("incoming stream error: {e:?}"),
@@ -189,13 +148,17 @@ async fn process_socket(
     tasks: Sender<Task>,
     socket: TcpStream,
     clients: Arc<Senders>,
-    pool: Arc<Mutex<PgPool>>,
+    db: Arc<db::Database>,
 ) -> anyhow::Result<()> {
     let (mut reader, mut writer) = socket.into_split();
-    if let Err(e) = authenticate(&mut reader, &mut writer, pool).await {
-        error!("{e}");
+    if let Err(e) = authenticate(&mut reader, &mut writer, db)
+        .await
+        .with_context(|| format!("Authenticating the user at address {addr:?} failed"))
+    {
+        error!("{e:#}");
         return Err(e);
     }
+    ser::Msg::Authenticated.send(&mut writer).await?;
     let (msg_producer, msg_consumer) = mpsc::channel(128);
     clients.insert(addr, msg_producer);
     join!(
@@ -208,67 +171,24 @@ async fn process_socket(
 async fn authenticate(
     reader: &mut OwnedReadHalf,
     writer: &mut OwnedWriteHalf,
-    pool: Arc<Mutex<PgPool>>,
+    db: Arc<db::Database>,
 ) -> anyhow::Result<()> {
-    let argon2 = Argon2::default();
-    ser::Msg::Info("Please log in with existing user or create a new one.".to_string())
-        .send(writer)
-        .await?;
     loop {
-        match cli::Msg::receive(reader).await? {
-            cli::Msg::Auth { username, password } => {
-                let pool = pool.lock().await;
-                match sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = $1")
-                    .bind(username.clone())
-                    .fetch_optional(&*pool)
-                    .await
-                    .with_context(|| "Querying the database for authentication failed.")?
-                {
-                    Some(user) => {
-                        if argon2
-                            .verify_password(
-                                password.as_bytes(),
-                                &PasswordHash::new(&user.password)?,
-                            )
-                            .is_ok()
-                        {
-                            ser::Msg::Info(format!(
-                                "Hi {}, logging in was successful!",
-                                user.username
-                            ))
-                            .send(writer)
-                            .await?;
-                            break Ok(());
-                        }
-                        ser::Msg::Info(format!(
-                            "Incorrect password for user \"{}\", try again!",
-                            user.username
-                        ))
-                        .send(writer)
-                        .await?;
-                    }
-                    None => {
-                        let password = argon2
-                            .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))?
-                            .to_string();
-                        sqlx::query("INSERT INTO users (username, password) VALUES ($1, $2);")
-                            .bind(username.clone())
-                            .bind(password)
-                            .execute(&*pool)
-                            .await?;
-                        ser::Msg::Info(format!("Welcome {username}, your account was created!"))
-                            .send(writer)
-                            .await?;
-                        break Ok(());
-                    }
-                }
-            }
-            _ => {
-                ser::Msg::Info("You need to log in before sending messages, try again.".to_string())
-                    .send(writer)
-                    .await?
-            }
-        }
+        let err = match cli::Msg::receive(reader).await? {
+            cli::Msg::Auth(cli::Auth::LogIn(user)) => match db.log_in(user.clone()).await {
+                Ok(()) => break Ok(()),
+                Err(db::Error::UserDoesNotExist(_)) => ser::Error::WrongUser,
+                Err(db::Error::WrongPassword(_)) => ser::Error::WrongPassword,
+                Err(e) => return Err(e.into()),
+            },
+            cli::Msg::Auth(cli::Auth::SignUp(user)) => match db.sign_up(user.clone()).await {
+                Ok(()) => break Ok(()),
+                Err(db::Error::UsernameTaken(_)) => ser::Error::UsernameTaken,
+                Err(e) => return Err(e.into()),
+            },
+            m => ser::Error::NotAuthenticated(m),
+        };
+        ser::Msg::Error(err).send(writer).await?;
     }
 }
 
@@ -281,7 +201,7 @@ async fn read_in_loop(addr: SocketAddr, tasks: Sender<Task>, mut reader: OwnedRe
             Ok(cli::Msg::Data(data)) => Broadcast(addr, data),
             Ok(cli::Msg::Auth { .. }) => todo!(),
             Err(DisconnectedStream(_)) => CloseStream(addr),
-            Err(e) => SendErr(addr, ServerErr::Receiving(format!("{e:?}"))),
+            Err(e) => SendErr(addr, ser::Error::Receiving(format!("{e:?}"))),
         };
         tasks
             .send(task.clone())
@@ -315,7 +235,7 @@ async fn write_each_msg(
                     Err(DisconnectedStream(_)) => break,
                     Err(e) => {
                         let err =
-                            ServerErr::Sending(format!("Sending a message to {addr} failed!"));
+                            ser::Error::Sending(format!("Sending a message to {addr} failed!"));
                         warn!("{err:?} because {e:?}");
                         let task = SendErr(from, err);
                         tasks.send(task).await.expect("Task queue stopped working!");
