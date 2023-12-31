@@ -1,4 +1,6 @@
 //! Client-Server Utilities
+//!
+//! TODO: buffered read and write <https://tokio.rs/tokio/tutorial/framing>
 
 use std::{
     ffi::{OsStr, OsString},

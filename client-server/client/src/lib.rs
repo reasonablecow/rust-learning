@@ -4,17 +4,15 @@
 //! ```sh
 //! cargo run -- --help
 //! ```
-//!
-//! TODO: buffered
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{anyhow, Context};
 use regex::Regex;
 use tokio::{
-    io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{self, AsyncReadExt},
     net::TcpStream,
     select,
-    sync::oneshot::{self, Receiver, Sender},
+    sync::{mpsc, oneshot},
 };
 
 use cli_ser::{cli, ser, Data, Messageable};
@@ -31,16 +29,16 @@ pub struct Client {
     pub save_png: bool,
 }
 impl Client {
-    /// Client's main function.
+    /// Sends messages (read form the terminal) to the server, and prints received ones.
     ///
-    /// The main thread in a loop executes commands given by the user.
-    /// Another thread is spawned in the background to receive messages from the server.
+    /// Spawns tcp receiver task and stdin reader thread.
+    /// Sends messages received from the reader thread channel to the server.
     pub async fn run(self) -> anyhow::Result<()> {
         let socket = TcpStream::connect(self.addr).await.with_context(|| {
             "Connection to the server failed, please make sure the server is running."
         })?;
 
-        let (reader, writer) = io::split(socket);
+        let (reader, mut writer) = io::split(socket);
 
         // Channel to indicate to stop waiting for messages.
         let (send_quit, recv_quit) = oneshot::channel();
@@ -49,22 +47,35 @@ impl Client {
         let receiver = tokio::spawn(self.clone().receive_in_loop(reader, recv_quit));
 
         // Parses and executes commands given by the user.
-        Self::send_from_stdin(writer, send_quit).await?;
+        let (msg_producer, mut msg_consumer) = mpsc::channel(128);
+        let stdin_reader =
+            std::thread::spawn(move || Self::parse_commands_from_stdin(msg_producer, send_quit));
+        while let Some(msg) = msg_consumer.recv().await {
+            msg.send(&mut writer)
+                .await
+                .with_context(|| "sending your message to the server failed")?;
+        }
+
+        // Returns error when stdin_reader failed (couldn't send quit to the receiver).
+        // .join()'s Err variant does not implement Error trait -> .expect.
+        stdin_reader
+            .join()
+            .expect("stdin command parser should never panic")
+            .with_context(|| "Command reader failed.")?;
 
         // Wait for the receiver to finish its job.
         receiver
-            .await
-            // // thread::Error doesn't implement Sync -> can not be used with anyhow
-            // .expect("Message receiver crashed even though it never should, contact the implementer!")
-            .with_context(|| "Receiver went through an unrecoverable error")??;
-        println!("Good bye!");
+            .await?
+            .with_context(|| "Receiver went through an unrecoverable error")?;
+
         Ok(())
     }
 
+    /// Receives and processes messages from the server until quit message comes.
     async fn receive_in_loop<S>(
         self,
         mut socket: S,
-        mut recv_quit: Receiver<()>,
+        mut quit: oneshot::Receiver<()>,
     ) -> anyhow::Result<()>
     where
         S: AsyncReadExt + std::marker::Unpin + std::marker::Send,
@@ -75,11 +86,12 @@ impl Client {
                 msg = ser::Msg::receive(&mut socket) => {
                     self.process_msg(msg.with_context(|| "reading a message from server failed")?).await;
                 }
-                _ = &mut recv_quit => break Ok(()),
+                _ = &mut quit => break Ok(()),
             )
         }
     }
 
+    /// Processes given message, either prints, or writes to a file.
     async fn process_msg(&self, msg: ser::Msg) {
         match msg {
             ser::Msg::DataFrom {
@@ -110,60 +122,49 @@ impl Client {
                 }
             }
             ser::Msg::Authenticated => println!("Welcome!"),
-            ser::Msg::Error(err) => eprintln!("Error: \"{err:?}\""),
+            ser::Msg::Error(ser::Error::WrongPassword) => {
+                eprintln!("Given password is not correct")
+            }
+            ser::Msg::Error(ser::Error::WrongUser) => {
+                eprintln!("The user does not exist, you can create it with a .signup")
+            }
+            ser::Msg::Error(ser::Error::UsernameTaken) => {
+                eprintln!("Unfortunately this username is already taken, choose another one.")
+            }
+            ser::Msg::Error(err) => eprintln!("Error: {err:?}"),
         };
     }
 
-    /// Reads commands from standard input, sends messages to the server.
+    /// Reads commands from standard input and sends messages or a quit signal over the appropriate channel.
     ///
     /// The [tokio documentation](https://docs.rs/tokio_wasi/latest/tokio/io/fn.stdin.html)
     /// says you should spawn a separate thread.
-    /// I had a problem to see it anywhere used like it, the
-    /// <https://google.github.io/comprehensive-rust/exercises/concurrency/chat-app.html>
-    /// uses BufReader.
     ///
-    /// TODO <https://docs.rs/tokio/latest/tokio/io/struct.Stdin.html>
-    /// For technical reasons, stdin is implemented by using an ordinary blocking read on a separate thread, and it is impossible to cancel that read. This can make shutdown of the runtime hang until the user presses enter.
+    /// I had a problem to see anywhere implemented that way, the
+    /// [Google Comprehensive Rust - Chat Application](https://google.github.io/comprehensive-rust/exercises/concurrency/chat-app.html)
+    /// uses BufReader, however it requires at least one "enter" stroke for tests.
     ///
-    /// TODO: use thread::spawn and tokio channel.
-    /// <https://www.reddit.com/r/rust/comments/ovxrd6/help_needed_reading_user_input_with_tokio/>
-    async fn send_from_stdin<S>(mut socket: S, send_quit: Sender<()>) -> anyhow::Result<()>
-    where
-        S: AsyncWriteExt + std::marker::Unpin + std::marker::Send,
-    {
-        let mut lines = BufReader::new(tokio::io::stdin()).lines(); // TODO
-
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .with_context(|| "reading your command failed")?
-        {
-            match Command::try_from(&*line) {
+    /// ["For technical reasons, stdin is implemented by using an ordinary blocking read on a separate thread, and it is impossible to cancel that read. This can make shutdown of the runtime hang until the user presses enter."](https://docs.rs/tokio/latest/tokio/io/struct.Stdin.html)
+    fn parse_commands_from_stdin(
+        messages: mpsc::Sender<cli::Msg>,
+        quit: oneshot::Sender<()>,
+    ) -> anyhow::Result<()> {
+        for line in std::io::stdin().lines() {
+            match Command::try_from(&*line?) {
                 Ok(Command::Quit) => {
-                    println!("Logging out...");
-                    // Time for messages which were sent but were not receivable yet.
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    send_quit.send(()).map_err(|_| {
+                    quit.send(()).map_err(|_| {
                         anyhow!("Sending a quit signal to the message receiver failed")
                     })?;
                     break;
                 }
-                Ok(Command::Msg(msg)) => msg
-                    .send(&mut socket)
-                    .await
-                    .with_context(|| "sending your message to the server failed")?,
+                Ok(Command::Msg(msg)) => messages
+                    .blocking_send(msg)
+                    .with_context(|| "Sending a parsed message failed")?,
                 Err(e) => eprintln!("Couldn't create your message (error: {e:?})"),
             };
         }
         Ok(())
     }
-}
-
-/// Reads line from standard input, strips ending newline if present.
-///
-/// todo: rewrite to strip_newline
-fn _strip_newline(line: String) -> String {
-    line.strip_suffix('\n').map(str::to_string).unwrap_or(line)
 }
 
 /// Commands useful for the client user.
@@ -213,10 +214,10 @@ impl TryFrom<&str> for Command {
     }
 }
 
-// TODO
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::time::Duration;
 
     #[test]
     fn command_from_str_quit() {
@@ -255,7 +256,6 @@ mod tests {
         }
     }
 
-    /// TODO: the test doesn't work without a single keyboard press
     #[tokio::test]
     async fn test_run() {
         let addr = SocketAddr::from((HOST_DEFAULT, PORT_DEFAULT));
