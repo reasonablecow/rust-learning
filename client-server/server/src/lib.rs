@@ -199,7 +199,7 @@ async fn read_in_loop(addr: SocketAddr, tasks: Sender<Task>, mut reader: OwnedRe
     loop {
         let task = match cli::Msg::receive(&mut reader).await {
             Ok(cli::Msg::Data(data)) => Broadcast(addr, data),
-            Ok(cli::Msg::Auth { .. }) => todo!(),
+            Ok(cli::Msg::Auth { .. }) => SendErr(addr, ser::Error::AlreadyAuthenticated(addr)), // TODO
             Err(DisconnectedStream(_)) => CloseStream(addr),
             Err(e) => SendErr(addr, ser::Error::Receiving(format!("{e:?}"))),
         };
