@@ -5,7 +5,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    io::{Cursor, Seek},
+    io::Cursor,
     path::{Path, PathBuf},
     result,
 };
@@ -35,16 +35,14 @@ pub enum Error {
     SerializeMsg(bincode::Error),
     #[error("deserialization of the message failed")]
     DeserializeMsg(bincode::Error),
-    #[error("saving the file failed")]
-    SaveFile(io::Error),
-    #[error("saving the image failed")]
-    SaveImg(io::Error),
-    #[error("converting image to another type failed")]
-    ConvertImg(image::error::ImageError),
-    #[error("loading image with format guessing failed")]
-    LoadImg(io::Error),
     #[error("loading file for a given path failed")]
     LoadFile(io::Error),
+    #[error("saving the file failed")]
+    SaveFile(io::Error),
+    #[error("decoding the image failed")]
+    DecodeImg(image::error::ImageError),
+    #[error("converting image to another type failed")]
+    ConvertImg(image::error::ImageError),
 }
 
 /// Remote definition of image::ImageFormat for de/serialization.
@@ -77,24 +75,19 @@ pub struct Image {
     bytes: Vec<u8>,
 }
 impl Image {
-    /// Creates Image from bytes read at path, guesses the image format based on the data.
+    /// Creates Image from the bytes read at the path.
     ///
-    /// Panics: When <https://docs.rs/image/latest/image/io/struct.Reader.html#method.with_guessed_format>
-    /// doesn't fail, but <https://docs.rs/image/latest/image/io/struct.Reader.html#method.format> does.
-    /// Based on the documentation it should never happen.
+    /// Guesses the image format based on the data or the path.
+    ///
+    /// Decodes the image in order to check the validity.
     async fn from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let reader = image::io::Reader::open(path)
-            .and_then(|r| r.with_guessed_format())
-            .map_err(LoadImg)?;
-        let format = reader.format().expect("Bug in the crate \"image \"! This should never fail when the previous step has succeeded.");
-
-        let mut buf_reader: std::io::BufReader<std::fs::File> = reader.into_inner();
-        buf_reader.seek(io::SeekFrom::Start(0)).map_err(LoadImg)?;
-        let mut file: fs::File = buf_reader.into_inner().into();
-
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).await.map_err(LoadImg)?;
+        let bytes = fs::read(&path).await.map_err(LoadFile)?;
+        let format = image::guess_format(&bytes)
+            .or_else(|_| image::ImageFormat::from_path(path))
+            .map_err(DecodeImg)?;
+        image::io::Reader::with_format(Cursor::new(&bytes), format)
+            .decode()
+            .map_err(DecodeImg)?;
         Ok(Image { format, bytes })
     }
 
@@ -103,21 +96,22 @@ impl Image {
         create_file_and_write_bytes(&path, &self.bytes)
             .await
             .map(|_| path)
-            .map_err(SaveImg)
+            .map_err(SaveFile)
     }
 
     pub async fn save_as_png(self, dir: &Path) -> Result<PathBuf> {
         if self.format != ImageFormat::Png {
             let mut bytes = Vec::<u8>::new();
-            image::io::Reader::with_format(Cursor::new(self.bytes), self.format)
+            let img = image::io::Reader::with_format(Cursor::new(self.bytes), self.format)
                 .decode()
-                .and_then(|img| img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png))
+                .map_err(DecodeImg)?;
+            img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
                 .map_err(ConvertImg)?;
             let path = Self::create_path(dir, ImageFormat::Png);
             create_file_and_write_bytes(&path, &bytes)
                 .await
                 .map(|_| path)
-                .map_err(SaveImg)
+                .map_err(SaveFile)
         } else {
             self.save(dir).await
         }
