@@ -17,7 +17,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-use cli_ser::{cli, ser, Data, Messageable};
+use cli_ser::{cli, ser, Data, File, Image, Messageable};
 
 pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
 pub const PORT_DEFAULT: u16 = 11111;
@@ -50,15 +50,13 @@ impl Client {
         let msg_receiver = tokio::spawn(self.receive_in_loop(reader, quit_receiver));
         let msg_sender = tokio::spawn(Self::handle_input(input_consumer, writer, quit_sender));
 
-        // Awaiting the msg_sender first is important, because it crashes if either
-        // stdin_reader crashes, or sending a quit signal fails.
-        msg_sender
-            .await?
-            .with_context(|| "Message sender crashed.")?;
-
+        // Awaiting the msg_receiver first is important for crash to show up when it happens.
         msg_receiver
             .await?
             .with_context(|| "Receiver went through an unrecoverable error")?;
+        msg_sender
+            .await?
+            .with_context(|| "Message sender crashed.")?;
 
         // thread .join()'s Err variant does not implement Error trait -> .expect.
         stdin_reader
@@ -151,10 +149,10 @@ impl Client {
                 eprintln!("Unfortunately this username is already taken, choose another one.")
             }
             ser::Msg::Error(ser::Error::NotAuthenticated(msg)) => {
-                eprintln!("You need to .login or .signup before sending a message (parsed message: {msg:?})")
+                eprintln!("You need to .login or .signup before sending a message (parsed message: {msg})")
             }
-            ser::Msg::Error(ser::Error::AlreadyAuthenticated(username)) => {
-                eprintln!("You are currently logged in as {username:?}, if you want to log in as another user first log out.")
+            ser::Msg::Error(ser::Error::AlreadyAuthenticated) => {
+                eprintln!("You are currently logged in, if you want to log in as another user first log out.")
             }
             ser::Msg::Error(err) => eprintln!("Error: {err:?}"),
         };
@@ -202,7 +200,7 @@ impl FromStr for Quit {
     }
 }
 
-/// Parses messages, files and images are read into memory.
+/// Parses message from string, files and images are read into memory.
 ///
 /// TODO: Document special phrases and its usage.
 /// TODO: Handle wrong usage such as .login without less than two arguments.
@@ -215,21 +213,21 @@ async fn parse_msg(line: &str) -> anyhow::Result<cli::Msg> {
         Regex::new(r"^\s*\.signup\s+(?<name>\S+)\s+(?<pswd>\S+)\s*.*$").expect(err_msg);
 
     let msg = if let Some((_, [file])) = reg_file.captures(line).map(|caps| caps.extract()) {
-        cli::Msg::file_from_path(file).await?
+        cli::Msg::ToAll(File::from_path(file).await?.into())
     } else if let Some((_, [image])) = reg_image.captures(line).map(|caps| caps.extract()) {
-        cli::Msg::img_from_path(image).await?
+        cli::Msg::ToAll(Image::from_path(image).await?.into())
     } else if let Some((_, [name, pswd])) = reg_log_in.captures(line).map(|caps| caps.extract()) {
-        cli::Msg::Auth(cli::Auth::LogIn(cli::User {
-            username: name.to_string(),
+        cli::Msg::Auth(cli::Auth::LogIn(cli::Credentials {
+            user: name.to_string().into(),
             password: pswd.to_string(),
         }))
     } else if let Some((_, [name, pswd])) = reg_sign_up.captures(line).map(|caps| caps.extract()) {
-        cli::Msg::Auth(cli::Auth::SignUp(cli::User {
-            username: name.to_string(),
+        cli::Msg::Auth(cli::Auth::SignUp(cli::Credentials {
+            user: name.to_string().into(),
             password: pswd.to_string(),
         }))
     } else {
-        cli::Msg::Data(Data::Text(line.to_string()))
+        cli::Msg::ToAll(Data::Text(line.to_string()))
     };
     Ok(msg)
 }
@@ -251,7 +249,7 @@ mod tests {
     async fn parse_msg_file() {
         let path = "Cargo.toml";
         assert_eq!(
-            cli::Msg::file_from_path(path).await.unwrap(),
+            cli::Msg::ToAll(File::from_path(path).await.unwrap().into()),
             parse_msg(&*format!(".file {path}")).await.unwrap()
         );
     }
@@ -260,7 +258,7 @@ mod tests {
     async fn parse_msg_img() {
         let path = "../example-images/rustacean-orig-noshadow.png";
         assert_eq!(
-            cli::Msg::img_from_path(path).await.unwrap(),
+            cli::Msg::ToAll(Image::from_path(path).await.unwrap().into()),
             parse_msg(&*format!(".image {path}")).await.unwrap()
         );
     }
@@ -269,7 +267,7 @@ mod tests {
     async fn parse_msg_text() {
         for s in ["some text"] {
             assert_eq!(
-                cli::Msg::Data(Data::Text(s.to_string())),
+                cli::Msg::ToAll(Data::Text(s.to_string())),
                 parse_msg(s).await.unwrap()
             );
         }

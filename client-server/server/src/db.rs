@@ -21,10 +21,10 @@ pub struct User {
     pub username: String,
     pub password: String,
 }
-impl From<cli::User> for User {
-    fn from(value: cli::User) -> User {
+impl From<cli::Credentials> for User {
+    fn from(value: cli::Credentials) -> Self {
         User {
-            username: value.username,
+            username: value.user.to_string(),
             password: value.password,
         }
     }

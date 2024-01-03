@@ -1,6 +1,6 @@
 //! # Server Executable
 //!
-//! Listens at a specified address and broadcasts every received message to all other connected clients.
+//! Listens at a specified address, reads from and writes to connected clients.
 //!
 //! You need to set up a database first, see [db].
 //!
@@ -16,7 +16,6 @@ use anyhow::Context;
 use chrono::{offset::Utc, SecondsFormat};
 use dashmap::DashMap;
 use tokio::{
-    join,
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
@@ -33,7 +32,7 @@ use tracing_subscriber::{
 mod db;
 
 use crate::Task::*;
-use cli_ser::{cli, ser, Data, Error::DisconnectedStream, Messageable};
+use cli_ser::{cli, ser, Error::DisconnectedStream, Messageable, User};
 
 pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
 pub const PORT_DEFAULT: u16 = 11111;
@@ -45,18 +44,12 @@ pub fn address_default() -> SocketAddr {
 /// Tasks to be initially queued at the server and addressed later.
 #[derive(Debug, Clone)]
 enum Task {
-    Broadcast(SocketAddr, Data),
-    SendErr(SocketAddr, ser::Error),
-    CloseStream(SocketAddr),
-}
-
-enum DataOrErr {
-    Data { from: SocketAddr, data: Data },
-    Err(ser::Error),
+    Broadcast(SocketAddr, ser::Msg),
+    SendErr(SocketAddr, ser::Msg),
 }
 
 /// Channels to tasks which writes to specified Address over TCP.
-type Senders = DashMap<SocketAddr, Sender<DataOrErr>>;
+type Senders = DashMap<SocketAddr, Sender<ser::Msg>>;
 
 pub struct Server {
     address: SocketAddr,
@@ -76,7 +69,7 @@ impl Server {
     }
 }
 
-/// Asynchronously listen for incoming clients, reads their messages and broadcasts them.
+/// Asynchronously listen for clients, reads their messages and acts accordingly.
 ///
 /// The server is bound to a specified address.
 /// In the main loop, the server processes tasks one at a time from its queue.
@@ -89,33 +82,30 @@ async fn run(server: Server) -> anyhow::Result<()> {
     while let Some(task) = task_consumer.recv().await {
         match task {
             Broadcast(addr_from, msg) => {
-                info!("broadcasting message from {addr_from:?}");
+                info!("broadcasting \"{msg}\" from {addr_from:?}");
                 for client in clients.iter() {
                     let (addr_to, msg_channel) = (client.key(), client.value());
                     if addr_from != *addr_to {
-                        debug!("broadcasting to {addr_to:?}");
-                        _ = msg_channel
-                            .send(DataOrErr::Data {
-                                data: msg.clone(),
-                                from: addr_from,
-                            })
-                            .await;
+                        match msg_channel.send(msg.clone()).await {
+                            Ok(_) => debug!("broadcasting to {addr_to:?}"),
+                            Err(e) => warn!("broadcasting to {addr_to:?} failed, error {e}"),
+                        }
                     }
                 }
             }
-            SendErr(addr, err) => {
+            SendErr(addr, msg) => {
                 if let Some(channel) = clients.get(&addr) {
-                    _ = channel.send(DataOrErr::Err(err)).await;
+                    if let Err(e) = channel.send(msg.clone()).await {
+                        warn!("Sending error msg {msg:?} to {addr} failed! Error: {e:?}");
+                    }
                 }
-            }
-            CloseStream(addr) => {
-                _ = clients.remove(&addr);
             }
         }
     }
     listener.await?
 }
 
+/// Listens for connections, spawns task to handle each client.
 async fn client_listener(
     address: SocketAddr,
     tasks: Sender<Task>,
@@ -128,130 +118,118 @@ async fn client_listener(
     info!("Server is listening at {address:?}");
     loop {
         match listener.accept().await {
-            Ok((socket, addr)) => {
+            Ok((mut socket, addr)) => {
                 info!("incoming {addr:?}");
-                tokio::spawn(process_socket(
-                    addr,
-                    tasks.clone(),
-                    socket,
-                    clients.clone(),
-                    db.clone(),
-                ));
+                {
+                    let (tasks, clients, db) = (tasks.clone(), clients.clone(), db.clone());
+                    tokio::spawn(async move {
+                        match authenticate(&mut socket, db).await {
+                            Ok(user) => {
+                                if let Err(e) =
+                                    manage_client(addr, user, socket, clients, tasks).await
+                                {
+                                    error!("Managing client at {addr} failed! Error {e:#}");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Authenticating the client at {addr} failed! Error {e:#}")
+                            }
+                        }
+                    });
+                }
             }
             Err(e) => error!("incoming stream error: {e:?}"),
         }
     }
 }
 
-async fn process_socket(
+/// Adds the client to `clients`, reads from and writes to it, then removes it from `clients`.
+async fn manage_client(
     addr: SocketAddr,
-    tasks: Sender<Task>,
+    user: User,
     socket: TcpStream,
     clients: Arc<Senders>,
-    db: Arc<db::Database>,
+    tasks: Sender<Task>,
 ) -> anyhow::Result<()> {
-    let (mut reader, mut writer) = socket.into_split();
-    if let Err(e) = authenticate(&mut reader, &mut writer, db)
-        .await
-        .with_context(|| format!("Authenticating the user at address {addr:?} failed"))
-    {
-        error!("{e:#}");
-        return Err(e);
-    }
-    ser::Msg::Authenticated.send(&mut writer).await?;
+    let (reader, writer) = socket.into_split();
+
     let (msg_producer, msg_consumer) = mpsc::channel(128);
+    let writer_task = tokio::spawn(write_each_msg(msg_consumer, writer));
+
     clients.insert(addr, msg_producer);
-    join!(
-        read_in_loop(addr, tasks.clone(), reader),
-        write_each_msg(addr, tasks.clone(), writer, msg_consumer),
-    );
+    let reader_res = read_in_loop(addr, user, reader, tasks.clone()).await;
+    clients
+        .remove(&addr)
+        .with_context(|| "Removing disconnected client \"{addr}\" from clients failed!")?;
+
+    reader_res.with_context(|| "Reading messages at {addr} failed!")?;
+    writer_task
+        .await
+        .context("Writer task should never panic, contact the implementer!")?;
     Ok(())
 }
 
-async fn authenticate(
-    reader: &mut OwnedReadHalf,
-    writer: &mut OwnedWriteHalf,
-    db: Arc<db::Database>,
-) -> anyhow::Result<()> {
-    loop {
-        let err = match cli::Msg::receive(reader).await? {
-            cli::Msg::Auth(cli::Auth::LogIn(user)) => match db.log_in(user.clone()).await {
-                Ok(()) => break Ok(()),
+async fn authenticate(socket: &mut TcpStream, db: Arc<db::Database>) -> anyhow::Result<User> {
+    let user = loop {
+        let err = match cli::Msg::receive(socket).await? {
+            cli::Msg::Auth(cli::Auth::LogIn(creds)) => match db.log_in(creds.clone()).await {
+                Ok(()) => break creds.user,
                 Err(db::Error::UserDoesNotExist(_)) => ser::Error::WrongUser,
                 Err(db::Error::WrongPassword(_)) => ser::Error::WrongPassword,
                 Err(e) => return Err(e.into()),
             },
-            cli::Msg::Auth(cli::Auth::SignUp(user)) => match db.sign_up(user.clone()).await {
-                Ok(()) => break Ok(()),
+            cli::Msg::Auth(cli::Auth::SignUp(creds)) => match db.sign_up(creds.clone()).await {
+                Ok(()) => break creds.user,
                 Err(db::Error::UsernameTaken(_)) => ser::Error::UsernameTaken,
                 Err(e) => return Err(e.into()),
             },
             m => ser::Error::NotAuthenticated(m),
         };
-        ser::Msg::Error(err).send(writer).await?;
-    }
+        ser::Msg::Error(err).send(socket).await?;
+    };
+    ser::Msg::Authenticated
+        .send(socket)
+        .await
+        .with_context(|| "Sending authentication confirmation failed!")?;
+    Ok(user)
 }
 
-/// Reads messages from `addr` in a loop, sends them to `tasks` queue.
-///
-/// Panics when sending a task to `tasks` fails.
-async fn read_in_loop(addr: SocketAddr, tasks: Sender<Task>, mut reader: OwnedReadHalf) {
+/// Receives messages from `reader` until disconnection, sends tasks to the `tasks` queue.
+async fn read_in_loop(
+    addr: SocketAddr,
+    user: User,
+    mut reader: OwnedReadHalf,
+    tasks: Sender<Task>,
+) -> anyhow::Result<()> {
     loop {
         let task = match cli::Msg::receive(&mut reader).await {
-            Ok(cli::Msg::Data(data)) => Broadcast(addr, data),
-            Ok(cli::Msg::Auth { .. }) => SendErr(addr, ser::Error::AlreadyAuthenticated(addr)), // TODO
-            Err(DisconnectedStream(_)) => CloseStream(addr),
-            Err(e) => SendErr(addr, ser::Error::Receiving(format!("{e:?}"))),
+            Ok(cli::Msg::ToAll(data)) => Broadcast(
+                addr,
+                ser::Msg::DataFrom {
+                    data,
+                    from: user.clone(),
+                },
+            ),
+            Ok(cli::Msg::Auth { .. }) => {
+                SendErr(addr, ser::Msg::Error(ser::Error::AlreadyAuthenticated))
+            }
+            Err(DisconnectedStream(_)) => break Ok(()),
+            Err(e) => SendErr(addr, ser::Msg::Error(ser::Error::ReceiveMsg(e.to_string()))),
         };
         tasks
-            .send(task.clone())
+            .send(task)
             .await
-            .expect("Emergency! Task queue stopped working!");
-        if let CloseStream(_) = task {
-            break;
-        }
+            .with_context(|| "Emergency! Task queue stopped working!")?;
     }
 }
 
-/// Writes every coming message from `messages` into `writer`.
-///
-/// Panics when sending a task to `tasks` fails.
-async fn write_each_msg(
-    addr: SocketAddr,
-    tasks: Sender<Task>,
-    mut writer: OwnedWriteHalf,
-    mut messages: Receiver<DataOrErr>,
-) {
-    while let Some(data_or_err) = messages.recv().await {
-        match data_or_err {
-            DataOrErr::Data { data, from } => {
-                match (ser::Msg::DataFrom {
-                    data,
-                    from: from.to_string(),
-                })
-                .send(&mut writer)
-                .await
-                {
-                    Err(DisconnectedStream(_)) => break,
-                    Err(e) => {
-                        let err =
-                            ser::Error::Sending(format!("Sending a message to {addr} failed!"));
-                        warn!("{err:?} because {e:?}");
-                        let task = SendErr(from, err);
-                        tasks.send(task).await.expect("Task queue stopped working!");
-                    }
-                    Ok(_) => {}
-                }
-            }
-            DataOrErr::Err(e) => {
-                let _ = ser::Msg::Error(e).send(&mut writer).await; // todo
-            }
-        };
+/// Writes every received message from `messages` into `writer`.
+async fn write_each_msg(mut messages: Receiver<ser::Msg>, mut writer: OwnedWriteHalf) {
+    while let Some(msg) = messages.recv().await {
+        if let Err(e) = msg.send(&mut writer).await {
+            error!("Writing the message {msg} to {writer:?} failed! Error {e}")
+        }
     }
-    tasks
-        .send(CloseStream(addr))
-        .await
-        .expect("Task queued stopped working!");
 }
 
 /// Subscribes to tracing (and logging), outputs to stdout and a log file.

@@ -1,18 +1,18 @@
 use std::time::Duration;
 
 use cli_ser::{
-    cli::{self, Auth::LogIn, Auth::SignUp, Msg::Auth, User},
+    cli::{self, Auth::LogIn, Auth::SignUp, Credentials, Msg::Auth},
     ser, Data, Messageable,
 };
 use tokio::net::TcpStream;
 
 use server::*;
 
-async fn client(s: &str, user: User) -> Data {
+async fn client(s: &str, creds: Credentials) -> Data {
     let mut stream = TcpStream::connect(address_default())
         .await
         .expect("Connecting to the server failed!");
-    Auth(LogIn(user))
+    Auth(LogIn(creds))
         .send(&mut stream)
         .await
         .expect("sending Auth failed");
@@ -20,7 +20,7 @@ async fn client(s: &str, user: User) -> Data {
     // wait for the other client to connect
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    cli::Msg::Data(Data::Text(s.to_string()))
+    cli::Msg::ToAll(Data::Text(s.to_string()))
         .send(&mut stream)
         .await
         .expect("sending of bytes should succeed");
@@ -47,23 +47,23 @@ async fn test_2_clients_text_message() {
     let server_thread = tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let user = User {
-        username: "test".to_string(),
+    let creds = Credentials {
+        user: "test".to_string().into(),
         password: "test_pass".to_string(),
     };
     {
         let mut stream = TcpStream::connect(address_default()).await.unwrap();
-        Auth(SignUp(user.clone())).send(&mut stream).await.unwrap();
+        Auth(SignUp(creds.clone())).send(&mut stream).await.unwrap();
         match ser::Msg::receive(&mut stream).await.unwrap() {
             ser::Msg::Authenticated | ser::Msg::Error(ser::Error::UsernameTaken) => {}
             other => panic!("{other:?}"),
         }
     }
     let s_1 = "hi from 1";
-    let conn_1 = tokio::spawn(client(s_1, user.clone()));
+    let conn_1 = tokio::spawn(client(s_1, creds.clone()));
 
     let s_2 = "hi from 2";
-    let conn_2 = tokio::spawn(client(s_2, user.clone()));
+    let conn_2 = tokio::spawn(client(s_2, creds.clone()));
 
     assert_eq!(data_to_string(conn_1.await.unwrap()), s_2.to_string());
     assert_eq!(data_to_string(conn_2.await.unwrap()), s_1.to_string());

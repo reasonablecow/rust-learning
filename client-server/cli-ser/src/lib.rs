@@ -1,10 +1,10 @@
 //! Client-Server Utilities
 //!
 //! TODO: buffered read and write <https://tokio.rs/tokio/tutorial/framing>
-//! TODO: `struct Username(String)` with From<&str>.
 
 use std::{
     ffi::{OsStr, OsString},
+    fmt::{self, Display},
     io::Cursor,
     path::{Path, PathBuf},
     result,
@@ -80,7 +80,7 @@ impl Image {
     /// Guesses the image format based on the data or the path.
     ///
     /// Decodes the image in order to check the validity.
-    async fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = fs::read(&path).await.map_err(LoadFile)?;
         let format = image::guess_format(&bytes)
             .or_else(|_| image::ImageFormat::from_path(path))
@@ -133,7 +133,7 @@ pub struct File {
     bytes: Vec<u8>,
 }
 impl File {
-    async fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let mut bytes = Vec::new();
         let mut file = fs::File::open(&path).await.map_err(LoadFile)?;
         file.read_to_end(&mut bytes).await.map_err(LoadFile)?;
@@ -179,37 +179,55 @@ impl From<Image> for Data {
         Data::Image(value)
     }
 }
+impl Display for Data {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => write!(f, "{text}"),
+            Self::File(File { name, .. }) => write!(f, "File {{ name: {name:?} }}"),
+            Self::Image(Image { format, .. }) => write!(f, "Image {{ format: {format:?} }}"),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct User(String);
+impl Display for User {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl From<String> for User {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
 
 pub mod cli {
     use crate::*;
-    use std::path::Path;
 
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
-    pub struct User {
-        pub username: String,
+    pub struct Credentials {
+        pub user: User,
         pub password: String,
     }
 
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
     pub enum Auth {
-        LogIn(User),
-        SignUp(User),
+        LogIn(Credentials),
+        SignUp(Credentials),
     }
 
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
     pub enum Msg {
         Auth(Auth),
-        Data(Data),
+        ToAll(Data),
     }
-    impl Msg {
-        /// Loads File from a path.
-        pub async fn file_from_path(path: impl AsRef<Path>) -> Result<Self> {
-            File::from_path(path).await.map(Data::from).map(Self::Data)
-        }
-
-        /// Loads Image from a path.
-        pub async fn img_from_path(path: impl AsRef<Path>) -> Result<Self> {
-            Image::from_path(path).await.map(Data::from).map(Self::Data)
+    impl Display for Msg {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::ToAll(data) => write!(f, "ToAll({data})"),
+                other => write!(f, "{other:?}"),
+            }
         }
     }
     impl Messageable for Msg {}
@@ -220,10 +238,10 @@ pub mod ser {
 
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
     pub enum Error {
-        Receiving(String),
-        Sending(String),
+        ReceiveMsg(String),
+        SendMsgTo(cli::Msg, User),
         NotAuthenticated(cli::Msg),
-        AlreadyAuthenticated(std::net::SocketAddr),
+        AlreadyAuthenticated,
         WrongUser,
         WrongPassword,
         UsernameTaken,
@@ -233,7 +251,7 @@ pub mod ser {
     pub enum Msg {
         Authenticated,
         Error(Error),
-        DataFrom { data: crate::Data, from: String },
+        DataFrom { data: Data, from: User },
     }
     impl From<Error> for Msg {
         fn from(value: Error) -> Self {
@@ -241,6 +259,16 @@ pub mod ser {
         }
     }
     impl Messageable for Msg {}
+    impl Display for Msg {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::DataFrom { data, from } => {
+                    write!(f, "DataFrom {{ data: {data}, from: {from:?} }}")
+                }
+                other => write!(f, "{other:?}"),
+            }
+        }
+    }
 }
 
 #[async_trait]

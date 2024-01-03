@@ -1,18 +1,18 @@
 use std::time::Duration;
 
 use cli_ser::{
-    cli::{self, Auth::LogIn, Auth::SignUp, Msg::Auth, User},
+    cli::{self, Auth::LogIn, Auth::SignUp, Credentials, Msg::Auth},
     ser, Data, Messageable,
 };
 use tokio::net::TcpStream;
 
 use server::*;
 
-async fn connect(user: User) -> TcpStream {
+async fn connect(creds: Credentials) -> TcpStream {
     let mut conn = TcpStream::connect(address_default())
         .await
         .expect("connecting to the server should succeed");
-    Auth(LogIn(user)).send(&mut conn).await.unwrap();
+    Auth(LogIn(creds)).send(&mut conn).await.unwrap();
     match ser::Msg::receive(&mut conn).await.unwrap() {
         ser::Msg::Authenticated => conn,
         other => panic!("{other:?}"),
@@ -20,7 +20,7 @@ async fn connect(user: User) -> TcpStream {
 }
 
 async fn send(socket: &mut TcpStream, s: &str) {
-    cli::Msg::Data(Data::Text(s.to_string()))
+    cli::Msg::ToAll(Data::Text(s.to_string()))
         .send(socket)
         .await
         .expect("sending a message to the server should work");
@@ -42,13 +42,13 @@ async fn test_5_clients_5_messages() {
     let server_thread = tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let user = User {
-        username: "test_user".to_string(),
+    let creds = Credentials {
+        user: "test_user".to_string().into(),
         password: "test_pass".to_string(),
     };
     {
         let mut stream = TcpStream::connect(address_default()).await.unwrap();
-        Auth(SignUp(user.clone())).send(&mut stream).await.unwrap();
+        Auth(SignUp(creds.clone())).send(&mut stream).await.unwrap();
         match ser::Msg::receive(&mut stream).await.unwrap() {
             ser::Msg::Authenticated | ser::Msg::Error(ser::Error::UsernameTaken) => {}
             other => panic!("{other:?}"),
@@ -56,9 +56,9 @@ async fn test_5_clients_5_messages() {
     }
 
     // Connection of client_1, client_2, client_3
-    let mut client_1 = connect(user.clone()).await;
-    let mut client_2 = connect(user.clone()).await;
-    let mut client_3 = connect(user.clone()).await;
+    let mut client_1 = connect(creds.clone()).await;
+    let mut client_2 = connect(creds.clone()).await;
+    let mut client_3 = connect(creds.clone()).await;
 
     // client_3 sends a message to client_1, client_2 (SEND AFTER CONNECTION)
     let msg_1 = "#1 from 3";
@@ -76,7 +76,7 @@ async fn test_5_clients_5_messages() {
     // tokio::time::sleep(Duration::from_secs(1)).await; // Wait for client_1 to receive it
 
     // Connection of client_4
-    let client_4 = connect(user.clone()).await;
+    let client_4 = connect(creds.clone()).await;
 
     // client_1 sends a message to client_3, client_4 (MESSAGE FROM OTHER CLIENT)
     let msg_3 = "#3 from 1";
@@ -94,7 +94,7 @@ async fn test_5_clients_5_messages() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connection of client_5
-    let client_5 = connect(user.clone()).await;
+    let client_5 = connect(creds.clone()).await;
     // Wait for all messages to arrive.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
