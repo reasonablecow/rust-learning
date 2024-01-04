@@ -3,7 +3,6 @@
 //! TODO: buffered read and write <https://tokio.rs/tokio/tutorial/framing>
 
 use std::{
-    ffi::{OsStr, OsString},
     fmt::{self, Display},
     io::Cursor,
     path::{Path, PathBuf},
@@ -126,10 +125,15 @@ impl Image {
         ))
     }
 }
+impl From<Image> for Vec<u8> {
+    fn from(img: Image) -> Self {
+        img.bytes
+    }
+}
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct File {
-    name: OsString,
+    name: String,
     bytes: Vec<u8>,
 }
 impl File {
@@ -137,21 +141,26 @@ impl File {
         let mut bytes = Vec::new();
         let mut file = fs::File::open(&path).await.map_err(LoadFile)?;
         file.read_to_end(&mut bytes).await.map_err(LoadFile)?;
-        let name = path
-            .as_ref()
-            .file_name()
-            .unwrap_or(OsStr::new("unknown"))
-            .to_os_string();
+
+        let name = match path.as_ref().file_name() {
+            Some(os_str) => os_str.to_string_lossy().into_owned(),
+            None => "unknown".to_string(),
+        };
         Ok(File { name, bytes })
     }
 
-    pub fn name(&self) -> &OsStr {
+    pub fn name(&self) -> &str {
         &self.name
     }
     pub async fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         create_file_and_write_bytes(path.as_ref().join(&self.name), &self.bytes)
             .await
             .map_err(SaveFile)
+    }
+}
+impl From<File> for (String, Vec<u8>) {
+    fn from(File { name, bytes }: File) -> Self {
+        (name, bytes)
     }
 }
 
@@ -199,6 +208,11 @@ impl Display for User {
 impl From<String> for User {
     fn from(value: String) -> Self {
         Self(value)
+    }
+}
+impl From<User> for String {
+    fn from(value: User) -> Self {
+        value.0
     }
 }
 

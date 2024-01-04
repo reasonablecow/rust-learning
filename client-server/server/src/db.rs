@@ -1,10 +1,4 @@
 //! All database related stuff.
-//!
-//! In order to set up the postgres database you can use:
-//! ```sh
-//! sudo docker run -p 5432:5432 --name pg -e POSTGRES_PASSWORD=pp -d postgres
-//! ```
-
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -12,14 +6,12 @@ use argon2::{
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tokio::sync::Mutex;
 
-use cli_ser::cli;
-
-const CONN_STR: &str = "postgres://postgres:pp@localhost:5432/postgres";
+use cli_ser::{cli, Data};
 
 #[derive(Clone, Debug, sqlx::FromRow)]
-pub struct User {
-    pub username: String,
-    pub password: String,
+pub(crate) struct User {
+    username: String,
+    password: String,
 }
 impl From<cli::Credentials> for User {
     fn from(value: cli::Credentials) -> Self {
@@ -30,6 +22,7 @@ impl From<cli::Credentials> for User {
     }
 }
 
+/// User table, since the username is not the primary key, it can be changed later.
 const CREATE_USERS: &str = r#"
 CREATE TABLE IF NOT EXISTS "users" (
   "id" bigserial PRIMARY KEY,
@@ -45,7 +38,7 @@ CREATE TABLE IF NOT EXISTS "messages" (
   "text_id" bigint,
   "file_id" bigint,
   "img_id" bigint,
-  "when_send" timestamp
+  "arrived" timestamp with time zone NOT NULL,
   check(
     (
       ("text_id" IS NOT NULL)::integer +
@@ -76,6 +69,7 @@ CREATE TABLE IF NOT EXISTS "files" (
   "bytes" bytea
 );
 "#;
+// TODO: img format
 const CREATE_IMAGES: &str = r#"
 CREATE TABLE IF NOT EXISTS "images" (
   "id" bigserial PRIMARY KEY,
@@ -143,11 +137,11 @@ pub(crate) struct Database {
     pool: Mutex<PgPool>,
 }
 impl Database {
-    pub(crate) async fn try_new() -> sqlx::Result<Database> {
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(CONN_STR)
-            .await?;
+    /// Connects to database specified by `url` and creates tables.
+    ///
+    /// The `url` specification can be read [here](https://docs.rs/sqlx/latest/sqlx/trait.ConnectOptions.html#implementors).
+    pub(crate) async fn try_new(url: &str) -> sqlx::Result<Database> {
+        let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
         sqlx::query(CREATE_USERS).execute(&pool).await?;
         sqlx::query(CREATE_MESSAGES).execute(&pool).await?;
         sqlx::query(CREATE_CHATS).execute(&pool).await?;
@@ -208,5 +202,62 @@ impl Database {
             .await
             .map(|_| ())
             .map_err(Error::Database)
+    }
+
+    /// Records information to the database about the `data` send to all users by the `user`.
+    pub(crate) async fn record_msg_to_all(&self, user: cli_ser::User, data: Data) -> Result<()> {
+        let insert_data_and_msg = |insert_data, data_type| {
+            format!(
+                "\
+WITH
+  usr as (
+    SELECT id FROM users WHERE username = ($1)
+  ),
+  data as (
+    {insert_data} RETURNING id
+  )
+INSERT INTO messages (from_user_id, {data_type}, arrived)
+SELECT usr.id, data.id, current_timestamp FROM usr, data;"
+            )
+        };
+        let username = String::from(user);
+        let pool = self.pool.lock().await;
+        match data {
+            Data::Text(text) => {
+                sqlx::query(&insert_data_and_msg(
+                    "INSERT INTO texts (text) VALUES ($2)",
+                    "text_id",
+                ))
+                .bind(username)
+                .bind(text)
+                .execute(&*pool)
+                .await
+            }
+            Data::File(file) => {
+                let (name, bytes): (String, Vec<u8>) = file.into();
+                sqlx::query(&insert_data_and_msg(
+                    "INSERT INTO files (name, bytes) VALUES ($2, $3)",
+                    "file_id",
+                ))
+                .bind(username)
+                .bind(name)
+                .bind(bytes)
+                .execute(&*pool)
+                .await
+            }
+            Data::Image(img) => {
+                let bytes: Vec<u8> = img.into();
+                sqlx::query(&insert_data_and_msg(
+                    "INSERT INTO images (bytes) VALUES ($2)",
+                    "img_id",
+                ))
+                .bind(username)
+                .bind(bytes)
+                .execute(&*pool)
+                .await
+            }
+        }
+        .map(|_| ())
+        .map_err(Error::Database)
     }
 }

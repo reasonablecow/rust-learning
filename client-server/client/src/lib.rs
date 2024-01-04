@@ -1,6 +1,21 @@
 //! # Client Executable
 //!
-//! See:
+//! Connects to server at specified address.
+//!
+//! ## Special Commands
+//!
+//! These phrases at the beginning of the line has a special meaning:
+//!
+//! * `.signup USER PASSWORD` - sends request to create a new user.
+//! * `.login USER PASSWORD` - sends a request to log in with the user.
+//! * `.file PATH` - sends given file.
+//! * `.image PATH` - sends given image if encoding succeeds.
+//!
+//! Anything else is transmitted as a **text** message.
+//!
+//! ## Command-line Options
+//!
+//! To see configurable options, run:
 //! ```sh
 //! cargo run -- --help
 //! ```

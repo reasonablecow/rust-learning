@@ -2,15 +2,29 @@
 //!
 //! Listens at a specified address, reads from and writes to connected clients.
 //!
-//! You need to set up a database first, see [db].
+//! ## Database Setup
 //!
-//! For options run:
+//! You need to set up a database e.g.
+//! ```sh
+//! sudo docker run -p 5432:5432 --name pg -e POSTGRES_PASSWORD=pp -d postgres
+//! ```
+//! and set the environment variable `DATABASE_URL` accordingly, e.g.
+//! ```sh
+//! export DATABASE_URL=postgres://postgres:pp@localhost:5432/postgres
+//! ```
+//! details about the postgres url can be found [here](https://docs.rs/sqlx/latest/sqlx/postgres/struct.PgConnectOptions.html)
+//! for other databases see [ConnectOptions](https://docs.rs/sqlx/latest/sqlx/trait.ConnectOptions.html#implementors).
+//!
+//! ## TCP Address
+//!
+//! Host and port can be set via command line arguments, see:
 //! ```sh
 //! cargo run -- --help
 //! ```
 //!
 //! TODO: Test client disconnection.
-use std::{net::SocketAddr, sync::Arc};
+
+use std::{env, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use chrono::{offset::Utc, SecondsFormat};
@@ -32,20 +46,16 @@ use tracing_subscriber::{
 mod db;
 
 use crate::Task::*;
-use cli_ser::{cli, ser, Error::DisconnectedStream, Messageable, User};
+use cli_ser::{cli, ser, Data, Error::DisconnectedStream, Messageable, User};
 
 pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
 pub const PORT_DEFAULT: u16 = 11111;
 
-pub fn address_default() -> SocketAddr {
-    SocketAddr::from((HOST_DEFAULT, PORT_DEFAULT))
-}
-
 /// Tasks to be initially queued at the server and addressed later.
 #[derive(Debug, Clone)]
 enum Task {
-    Broadcast(SocketAddr, ser::Msg),
-    SendErr(SocketAddr, ser::Msg),
+    Broadcast(SocketAddr, User, Data),
+    SendErr(SocketAddr, ser::Error),
 }
 
 /// Channels to tasks which writes to specified Address over TCP.
@@ -56,10 +66,12 @@ pub struct Server {
     db: Arc<db::Database>,
 }
 impl Server {
-    /// Builds the server, especially database initialization, takes time."
+    /// Builds the server, especially database initialization, takes time.
     pub async fn build(address: impl Into<SocketAddr>) -> anyhow::Result<Self> {
+        let url =
+            env::var("DATABASE_URL").context("Environment variable DATABASE_URL was not set!")?;
         let address = address.into();
-        let db = Arc::new(db::Database::try_new().await?);
+        let db = Arc::new(db::Database::try_new(&url).await?);
         Ok(Server { address, db })
     }
 
@@ -81,8 +93,12 @@ async fn run(server: Server) -> anyhow::Result<()> {
     let listener = tokio::spawn(client_listener(address, task_producer, clients.clone(), db));
     while let Some(task) = task_consumer.recv().await {
         match task {
-            Broadcast(addr_from, msg) => {
-                info!("broadcasting \"{msg}\" from {addr_from:?}");
+            Broadcast(addr_from, user_from, data) => {
+                info!("broadcasting \"{data}\" from {user_from} at {addr_from:?}");
+                let msg = ser::Msg::DataFrom {
+                    data: data.clone(),
+                    from: user_from.clone(),
+                };
                 for client in clients.iter() {
                     let (addr_to, msg_channel) = (client.key(), client.value());
                     if addr_from != *addr_to {
@@ -93,10 +109,10 @@ async fn run(server: Server) -> anyhow::Result<()> {
                     }
                 }
             }
-            SendErr(addr, msg) => {
+            SendErr(addr, err) => {
                 if let Some(channel) = clients.get(&addr) {
-                    if let Err(e) = channel.send(msg.clone()).await {
-                        warn!("Sending error msg {msg:?} to {addr} failed! Error: {e:?}");
+                    if let Err(e) = channel.send(ser::Msg::Error(err.clone()).clone()).await {
+                        warn!("Sending error msg {err:?} to {addr} failed! Error: {e:?}");
                     }
                 }
             }
@@ -123,10 +139,10 @@ async fn client_listener(
                 {
                     let (tasks, clients, db) = (tasks.clone(), clients.clone(), db.clone());
                     tokio::spawn(async move {
-                        match authenticate(&mut socket, db).await {
+                        match authenticate(&mut socket, db.clone()).await {
                             Ok(user) => {
                                 if let Err(e) =
-                                    manage_client(addr, user, socket, clients, tasks).await
+                                    manage_client(addr, user, socket, clients, db, tasks).await
                                 {
                                     error!("Managing client at {addr} failed! Error {e:#}");
                                 }
@@ -149,6 +165,7 @@ async fn manage_client(
     user: User,
     socket: TcpStream,
     clients: Arc<Senders>,
+    db: Arc<db::Database>,
     tasks: Sender<Task>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = socket.into_split();
@@ -157,7 +174,7 @@ async fn manage_client(
     let writer_task = tokio::spawn(write_each_msg(msg_consumer, writer));
 
     clients.insert(addr, msg_producer);
-    let reader_res = read_in_loop(addr, user, reader, tasks.clone()).await;
+    let reader_res = read_in_loop(addr, user, reader, db, tasks.clone()).await;
     clients
         .remove(&addr)
         .with_context(|| "Removing disconnected client \"{addr}\" from clients failed!")?;
@@ -199,22 +216,20 @@ async fn read_in_loop(
     addr: SocketAddr,
     user: User,
     mut reader: OwnedReadHalf,
+    db: Arc<db::Database>,
     tasks: Sender<Task>,
 ) -> anyhow::Result<()> {
     loop {
         let task = match cli::Msg::receive(&mut reader).await {
-            Ok(cli::Msg::ToAll(data)) => Broadcast(
-                addr,
-                ser::Msg::DataFrom {
-                    data,
-                    from: user.clone(),
-                },
-            ),
-            Ok(cli::Msg::Auth { .. }) => {
-                SendErr(addr, ser::Msg::Error(ser::Error::AlreadyAuthenticated))
+            Ok(cli::Msg::ToAll(data)) => {
+                if let Err(e) = db.record_msg_to_all(user.clone(), data.clone()).await {
+                    error!("{e}"); // TODO
+                }
+                Broadcast(addr, user.clone(), data)
             }
+            Ok(cli::Msg::Auth { .. }) => SendErr(addr, ser::Error::AlreadyAuthenticated),
             Err(DisconnectedStream(_)) => break Ok(()),
-            Err(e) => SendErr(addr, ser::Msg::Error(ser::Error::ReceiveMsg(e.to_string()))),
+            Err(e) => SendErr(addr, ser::Error::ReceiveMsg(e.to_string())),
         };
         tasks
             .send(task)

@@ -21,6 +21,10 @@ It listens at a specified address (provided through command-line arguments).
 Received messages are broadcasted to all other connected clients.
 The `server` also depends on the `cli-ser` crate.
 
+### !!!Database Setup!!!
+
+`server` needs a running database and its URL, see `server`s documentation.
+
 ## [cli-ser](./cli-ser)
 
 Library crate that proves to be handy when implementing either a client or server.

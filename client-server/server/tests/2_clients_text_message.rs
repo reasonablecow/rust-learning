@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use cli_ser::{
     cli::{self, Auth::LogIn, Auth::SignUp, Credentials, Msg::Auth},
@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 use server::*;
 
 async fn client(s: &str, creds: Credentials) -> Data {
-    let mut stream = TcpStream::connect(address_default())
+    let mut stream = TcpStream::connect(SocketAddr::from((HOST_DEFAULT, PORT_DEFAULT)))
         .await
         .expect("Connecting to the server failed!");
     Auth(LogIn(creds))
@@ -43,7 +43,8 @@ fn data_to_string(m: Data) -> String {
 
 #[tokio::test]
 async fn test_2_clients_text_message() {
-    let server = server::Server::build(address_default()).await.unwrap();
+    let address = (HOST_DEFAULT, PORT_DEFAULT);
+    let server = server::Server::build(address).await.unwrap();
     let server_thread = tokio::spawn(server.run());
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -52,7 +53,7 @@ async fn test_2_clients_text_message() {
         password: "test_pass".to_string(),
     };
     {
-        let mut stream = TcpStream::connect(address_default()).await.unwrap();
+        let mut stream = TcpStream::connect(SocketAddr::from(address)).await.unwrap();
         Auth(SignUp(creds.clone())).send(&mut stream).await.unwrap();
         match ser::Msg::receive(&mut stream).await.unwrap() {
             ser::Msg::Authenticated | ser::Msg::Error(ser::Error::UsernameTaken) => {}
