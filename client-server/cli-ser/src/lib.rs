@@ -1,76 +1,113 @@
 //! Client-Server Utilities
-//!
-//! TODO: cli-ser error enum instead of all panics
 
 use std::{
-    error::Error,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Cursor, ErrorKind, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
-    thread,
-    time::Duration,
+    result,
 };
 
 use chrono::{offset::Utc, SecondsFormat};
-use regex::Regex;
+use image::ImageFormat;
 use serde::{Deserialize, Serialize};
 
-/// This whole thing wouldn't exist if image::ImageFormat would be serializable
+use crate::Error::*;
+
+type Result<T> = result::Result<T, Error>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("receiving bytes from the stream failed")]
+    ReceiveBytes(io::Error),
+    #[error("the stream was disconnected")]
+    DisconnectedStream(io::Error),
+    #[error("sending bytes over the stream failed")]
+    SendBytes(io::Error),
+    #[error("message serialization failed")]
+    SerializeMsg(bincode::Error),
+    #[error("deserialization of the message failed")]
+    DeserializeMsg(bincode::Error),
+    #[error("saving the file failed")]
+    SaveFile(io::Error),
+    #[error("saving the image failed")]
+    SaveImg(io::Error),
+    #[error("operation convert and save image failed")]
+    ConvertAndSaveImg(image::error::ImageError),
+    #[error("loading image with format guessing failed")]
+    LoadImg(io::Error),
+    #[error("loading file for a given path failed")]
+    LoadFile(io::Error),
+}
+
+/// Remote definition of image::ImageFormat for de/serialization.
+/// Based on <https://serde.rs/remote-derive.html>.
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
-pub enum ImageFormat {
+#[serde(remote = "ImageFormat")]
+#[non_exhaustive]
+pub enum ImageFormatDef {
     Png,
     Jpeg,
-    //... I hope there is a better way to solve this but otherwise here would go the duplicates.
-}
-impl ImageFormat {
-    fn to_str(self) -> &'static str {
-        // Every format has at least one <https://docs.rs/image/latest/src/image/image.rs.html#290-309>.
-        self.to_official().extensions_str()[0]
-    }
-
-    fn to_official(self) -> image::ImageFormat {
-        match self {
-            ImageFormat::Png => image::ImageFormat::Png,
-            ImageFormat::Jpeg => image::ImageFormat::Jpeg,
-        }
-    }
-
-    fn from_official(format: image::ImageFormat) -> Self {
-        match format {
-            image::ImageFormat::Png => ImageFormat::Png,
-            image::ImageFormat::Jpeg => ImageFormat::Jpeg,
-            _ => todo!(),
-        }
-    }
+    Gif,
+    WebP,
+    Pnm,
+    Tiff,
+    Tga,
+    Dds,
+    Bmp,
+    Ico,
+    Hdr,
+    OpenExr,
+    Farbfeld,
+    Avif,
+    Qoi,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct Image {
+    #[serde(with = "ImageFormatDef")]
     format: ImageFormat,
     bytes: Vec<u8>,
 }
-
 impl Image {
-    pub fn save(&self, dir: &Path) {
-        fs::File::create(Self::create_path(dir, self.format))
-            .expect("File creation failed.")
-            .write_all(&self.bytes)
-            .expect("Writing the file failed.");
+    /// Creates Image from bytes read at path, guesses the image format based on the data.
+    ///
+    /// Panics: When <https://docs.rs/image/latest/image/io/struct.Reader.html#method.with_guessed_format>
+    /// doesn't fail, but <https://docs.rs/image/latest/image/io/struct.Reader.html#method.format> does.
+    /// Based on the documentation it should never happen.
+    fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let reader = image::io::Reader::open(path)
+            .and_then(|r| r.with_guessed_format())
+            .map_err(LoadImg)?;
+        let format = reader.format().expect("Bug in the crate \"image \"! This should never fail when the previous step has succeeded.");
+
+        let mut bytes = Vec::new();
+        reader
+            .into_inner()
+            .read_to_end(&mut bytes)
+            .map_err(LoadImg)?;
+        Ok(Image { format, bytes })
     }
 
-    pub fn save_as_png(self, dir: &Path) {
+    pub fn save(&self, dir: &Path) -> Result<PathBuf> {
+        let path = Self::create_path(dir, self.format);
+        create_file_and_write_bytes(&path, &self.bytes)
+            .map(|_| path)
+            .map_err(SaveImg)
+    }
+
+    pub fn save_as_png(self, dir: &Path) -> Result<PathBuf> {
         if self.format != ImageFormat::Png {
-            image::io::Reader::with_format(Cursor::new(self.bytes), self.format.to_official())
+            let path = Self::create_path(dir, ImageFormat::Png);
+            image::io::Reader::with_format(Cursor::new(self.bytes), self.format)
                 .decode()
-                .expect("Image decoding failed.")
-                .save_with_format(
-                    Self::create_path(dir, ImageFormat::Png),
-                    image::ImageFormat::Png,
-                )
-                .expect("Encoding and writing to a file should work.");
+                .and_then(|d| d.save_with_format(&path, ImageFormat::Png))
+                .map(|_| path)
+                .map_err(ConvertAndSaveImg)
         } else {
-            self.save(dir);
+            self.save(dir)
         }
     }
 
@@ -78,210 +115,139 @@ impl Image {
         dir.join(format!(
             "{}.{}",
             Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            format.to_str()
+            // It's safe: <https://docs.rs/image/latest/src/image/image.rs.html#290-309>.
+            format.extensions_str()[0]
         ))
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct File {
-    // TODO: make the fields private with getters for future stability
-    pub name: PathBuf,
-    pub bytes: Vec<u8>,
+    name: OsString,
+    bytes: Vec<u8>,
+}
+impl File {
+    fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .map_err(LoadFile)?;
+        let name = path
+            .as_ref()
+            .file_name()
+            .unwrap_or(OsStr::new("unknown"))
+            .to_os_string();
+        Ok(File { name, bytes })
+    }
+
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        create_file_and_write_bytes(path.as_ref().join(&self.name), &self.bytes).map_err(SaveFile)
+    }
+}
+
+fn create_file_and_write_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
+    fs::File::create(path)?.write_all(bytes)
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ServerErr {
+    Receving(String),
+    Sending(String),
 }
 
 /// Messages to be sent over the network.
+///
+/// TODO: Client can send Error message to the server which is confusing.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Message {
     Text(String),
     File(File),
     Image(Image),
+    ServerErr(ServerErr),
 }
-
 impl Message {
-    pub fn from_cmd(cmd: Command) -> Result<Message, Box<dyn Error>> {
-        match cmd {
-            Command::Quit => Err("A Massage can not be constructed from a Quit command!".into()),
-            Command::Other(s) => Ok(Message::Text(s)),
-            Command::File(path) => {
-                let path = PathBuf::from(path);
-                let name = path
-                    .file_name()
-                    .expect("Path given does not end with a valid file name.")
-                    .into();
-                let mut file =
-                    fs::File::open(path).expect("File for the given path can not be opened.");
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)
-                    .expect("Reading the specified file failed.");
+    /// Loads File from a path.
+    pub fn file_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        File::from_path(path).map(Message::from)
+    }
 
-                Ok(Message::File(File { name, bytes }))
-            }
-            Command::Image(path) => {
-                let reader = image::io::Reader::open(path)
-                    .expect("Image opening failed.")
-                    .with_guessed_format()
-                    .expect("The format should be deducible.");
+    /// Loads Image from a path.
+    pub fn img_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        Image::from_path(path).map(Message::from)
+    }
 
-                let format = ImageFormat::from_official(
-                    reader.format().expect("The image format must be clear!"),
-                );
+    /// Serializes Message into bytes.
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).map_err(SerializeMsg)
+    }
 
-                let mut bytes = Vec::new();
-                reader
-                    .into_inner()
-                    .read_to_end(&mut bytes)
-                    .expect("Reading the specified file failed.");
+    /// Deserialize Message from bytes.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+        bincode::deserialize(bytes).map_err(DeserializeMsg)
+    }
 
-                Ok(Message::Image(Image { format, bytes }))
-            }
-        }
+    /// Tries to receive a message from the given stream.
+    pub fn receive(stream: &mut TcpStream) -> Result<Option<Self>> {
+        receive_bytes(stream)?
+            .as_deref()
+            .map(Self::deserialize)
+            .transpose()
+    }
+
+    /// Sends a message over the given stream.
+    pub fn send(&self, stream: &mut TcpStream) -> Result<()> {
+        self.serialize()
+            .and_then(|bytes| send_bytes(stream, &bytes))
+    }
+}
+impl From<File> for Message {
+    fn from(value: File) -> Message {
+        Message::File(value)
+    }
+}
+impl From<Image> for Message {
+    fn from(value: Image) -> Message {
+        Message::Image(value)
     }
 }
 
-/// Commands useful for the client user.
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-pub enum Command {
-    Quit,
-    File(String),
-    Image(String),
-    Other(String),
-}
-
-impl Command {
-    pub fn from_stdin() -> Command {
-        let mut line = String::new();
-        io::stdin()
-            .read_line(&mut line)
-            .expect("reading standard input should work.");
-        let line = if let Some(stripped) = line.strip_suffix('\n') {
-            stripped.to_string()
-        } else {
-            line
-        };
-        Command::from_str(&line)
-    }
-
-    fn from_str(s: &str) -> Command {
-        let err_msg = "unexpected regex error, contact the crate implementer";
-        let reg_quit = Regex::new(r"^\s*\.quit\s*$").expect(err_msg);
-        let reg_file = Regex::new(r"^\s*\.file\s+(?<file>\S+.*)\s*$").expect(err_msg);
-        let reg_image = Regex::new(r"^\s*\.image\s+(?<image>\S+.*)\s*$").expect(err_msg);
-
-        if reg_quit.is_match(s) {
-            Command::Quit
-        } else if let Some((_, [file])) = reg_file.captures(s).map(|caps| caps.extract()) {
-            Command::File(file.to_string())
-        } else if let Some((_, [image])) = reg_image.captures(s).map(|caps| caps.extract()) {
-            Command::Image(image.to_string())
-        } else {
-            Command::Other(s.to_string())
-        }
-    }
-}
-
-/// Tries to read a message in a nonblocking fashion.
+/// Tries to receive bytes (first asks for byte count) from given stream.
 ///
-/// Panics for other io::Errors than empty or closed streams.
-pub fn read_msg(stream: &mut TcpStream) -> Option<Message> {
-    stream
-        .set_nonblocking(true)
-        .expect("Setting non-blocking stream to check for data to be read failed.");
+/// Asks for the byte count in a non-blocking manner; upon success, the byte reading becomes blocking.
+pub fn receive_bytes(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
+    stream.set_nonblocking(true).map_err(ReceiveBytes)?;
     let mut len_bytes = [0u8; 4];
     match stream.read_exact(&mut len_bytes) {
-        Ok(()) => {
-            stream
-                .set_nonblocking(false)
-                .expect("Setting blocking stream to read the data.");
-            let len = u32::from_be_bytes(len_bytes) as usize;
-            let mut msg_buf = vec![0u8; len];
-            stream
-                .read_exact(&mut msg_buf)
-                .expect("Reading the whole message should be ok.");
-            let msg: Message = bincode::deserialize(&msg_buf[..])
-                .expect("Deserialization of the read message should be ok.");
-            Some(msg)
-        }
+        Ok(()) => stream
+            .set_nonblocking(false)
+            .and_then(|_| {
+                let len = u32::from_be_bytes(len_bytes) as usize;
+                let mut bytes = vec![0u8; len];
+                stream.read_exact(&mut bytes).map(|_| Some(bytes))
+            })
+            .map_err(ReceiveBytes),
         Err(e) => match e.kind() {
-            ErrorKind::WouldBlock // No message is ready
-            | ErrorKind::UnexpectedEof // The stream was closed
-            => None,
-            _ => panic!("{:?}", e),
+            ErrorKind::WouldBlock => Ok(None), // No message is ready
+            ErrorKind::UnexpectedEof => Err(DisconnectedStream(e)),
+            _ => Err(ReceiveBytes(e)),
         },
     }
 }
 
-/// Serializes Message into bytes.
-///
-/// Panics when serialization fails (should never happen).
-pub fn serialize_msg(msg: &Message) -> Vec<u8> {
-    bincode::serialize(msg)
-        .expect("Message serialization should always work - contact the implementer!")
-}
-
-/// Sends bytes over given stream.
-///
-/// Panics! BrokenPipe error kind occurs when sending a message to a closed stream.
-pub fn send_bytes(stream: &mut TcpStream, bytes: &Vec<u8>) -> Result<(), io::Error> {
-    stream.write_all(&((bytes.len() as u32).to_be_bytes()))?;
-    stream.write_all(bytes)?;
-    stream.flush()?;
-    Ok(())
-}
-
-/// Deprecated! Useful for testing initially.
-/// TODO: Add a test simulating simple client and server.
-pub fn _simulate_connections() {
-    let connection_simulator = thread::spawn(move || {
-        let mut streams = Vec::new();
-        for sth in ["one", "two", "three", "four", "five"] {
-            let mut stream = TcpStream::connect("127.0.0.1:11111")
-                .expect("TCP stream connection from another thread should be possible.");
-            let bytes = serialize_msg(&Message::Text(sth.to_string()));
-            send_bytes(&mut stream, &bytes).expect("sending bytes to the server should work");
-            streams.push(stream);
-        }
-        streams
-    });
-    let streams = connection_simulator
-        .join()
-        .expect("the streams should be returned.");
-    println!("{:?}", streams);
-    thread::sleep(Duration::from_secs(3));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn command_from_str_quit() {
-        assert_eq!(Command::Quit, Command::from_str(".quit"));
-        assert_eq!(Command::Quit, Command::from_str("      .quit      "));
-    }
-
-    #[test]
-    fn command_from_str_file() {
-        let f = "a.txt";
-        assert_eq!(
-            Command::File(String::from(f)),
-            Command::from_str(&format!(".file {}", f))
-        );
-    }
-
-    #[test]
-    fn command_from_str_image() {
-        let i = "i.png";
-        assert_eq!(
-            Command::Image(String::from(i)),
-            Command::from_str(&format!(".image {}", i))
-        );
-    }
-
-    #[test]
-    fn command_from_str_other() {
-        for s in [". quit", ".quit      s", "a   .quit "] {
-            assert_eq!(Command::Other(String::from(s)), Command::from_str(s));
-        }
-    }
+/// Tries to send bytes over given stream.
+pub fn send_bytes(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+    stream
+        .write_all(&((bytes.len() as u32).to_be_bytes()))
+        .and_then(|_| stream.write_all(bytes))
+        .and_then(|_| stream.flush())
+        .map_err(|e| {
+            if e.kind() == ErrorKind::BrokenPipe {
+                DisconnectedStream(e)
+            } else {
+                SendBytes(e)
+            }
+        })
 }
