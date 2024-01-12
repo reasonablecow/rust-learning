@@ -1,6 +1,9 @@
-//! Client-Server Utilities
+//! Client-Server
 //!
-//! TODO: buffered read and write <https://tokio.rs/tokio/tutorial/framing>
+//! Foundations for communication between a client and a server.
+// TODO: buffered read and write <https://tokio.rs/tokio/tutorial/framing>
+// TODO: <https://docs.rs/futures> combinators for read_bytes and write_bytes
+// TODO: check if [async_trait] can be removed since rust 1.75 (warnings)
 
 use std::{
     fmt::{self, Display},
@@ -22,6 +25,7 @@ use crate::Error::*;
 
 type Result<T> = result::Result<T, Error>;
 
+/// [cli-ser][self] errors, provides a brief explanation and access to the underlying source error.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("receiving bytes from the stream failed")]
@@ -45,11 +49,12 @@ pub enum Error {
 }
 
 /// Remote definition of image::ImageFormat for de/serialization.
+///
 /// Based on <https://serde.rs/remote-derive.html>.
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
 #[serde(remote = "ImageFormat")]
 #[non_exhaustive]
-pub enum ImageFormatDef {
+enum ImageFormatDef {
     Png,
     Jpeg,
     Gif,
@@ -67,6 +72,7 @@ pub enum ImageFormatDef {
     Qoi,
 }
 
+/// An image type, can be [loaded from a path][Self::from_path] (with a validity check) and [saved to a path][Self::save] (optionally [as PNG][Self::save_as_png]).
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct Image {
     #[serde(with = "ImageFormatDef")]
@@ -74,7 +80,7 @@ pub struct Image {
     bytes: Vec<u8>,
 }
 impl Image {
-    /// Creates Image from the bytes read at the path.
+    /// Creates Image from the bytes read at the `path`.
     ///
     /// Guesses the image format based on the data or the path.
     ///
@@ -90,6 +96,7 @@ impl Image {
         Ok(Image { format, bytes })
     }
 
+    /// Saves the image to a new path based on the given `dir` and current time.
     pub async fn save(&self, dir: &Path) -> Result<PathBuf> {
         let path = Self::create_path(dir, self.format);
         create_file_and_write_bytes(&path, &self.bytes)
@@ -98,6 +105,7 @@ impl Image {
             .map_err(SaveFile)
     }
 
+    /// Converts the image to the PNG format and saves it to a new path based on the given `dir` and current time.
     pub async fn save_as_png(self, dir: &Path) -> Result<PathBuf> {
         if self.format != ImageFormat::Png {
             let mut bytes = Vec::<u8>::new();
@@ -131,12 +139,14 @@ impl From<Image> for Vec<u8> {
     }
 }
 
+/// A file type, can be [read from a path][Self::from_path] and [saved to a path][Self::save].
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct File {
     name: String,
     bytes: Vec<u8>,
 }
 impl File {
+    /// Reads a file from the `path`, the filename can change if it contained non-unicode symbols.
     pub async fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let mut bytes = Vec::new();
         let mut file = fs::File::open(&path).await.map_err(LoadFile)?;
@@ -149,9 +159,12 @@ impl File {
         Ok(File { name, bytes })
     }
 
+    /// Returns the unicode version of the filename.
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Saves the file to the `path` under its [name][Self::name].
     pub async fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         create_file_and_write_bytes(path.as_ref().join(&self.name), &self.bytes)
             .await
@@ -164,6 +177,7 @@ impl From<File> for (String, Vec<u8>) {
     }
 }
 
+/// Creates a file at the `path` and writes the `bytes` to it, if the file already exists, it is replaced.
 async fn create_file_and_write_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
     let mut file = fs::File::create(path).await?;
     file.write_all(bytes).await?;
@@ -171,7 +185,7 @@ async fn create_file_and_write_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io
     Ok(())
 }
 
-/// Data to be sent over the network.
+/// Basic data type, wrapper around [Text][Data::Text], [File] and [Image] types.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Data {
     Text(String),
@@ -198,6 +212,7 @@ impl Display for Data {
     }
 }
 
+/// A user type.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct User(String);
 impl Display for User {
@@ -216,6 +231,7 @@ impl From<User> for String {
     }
 }
 
+/// Module for client [messages][cli::Msg].
 pub mod cli {
     use crate::*;
 
@@ -225,6 +241,7 @@ pub mod cli {
         pub password: String,
     }
 
+    /// Authentication variants.
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
     pub enum Auth {
         LogIn(Credentials),
@@ -234,6 +251,7 @@ pub mod cli {
     #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
     pub enum Msg {
         Auth(Auth),
+        /// Message with data intended to be forwarded to everyone.
         ToAll(Data),
     }
     impl Display for Msg {
@@ -247,6 +265,7 @@ pub mod cli {
     impl Messageable for Msg {}
 }
 
+/// Module for server [messages][ser::Msg].
 pub mod ser {
     use crate::*;
 
@@ -272,7 +291,6 @@ pub mod ser {
             Msg::Error(value)
         }
     }
-    impl Messageable for Msg {}
     impl Display for Msg {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
@@ -283,41 +301,44 @@ pub mod ser {
             }
         }
     }
+    impl Messageable for Msg {}
 }
 
+/// Enables types to be sent on one end and received on the other.
 #[async_trait]
 pub trait Messageable
 where
     Self: serde::ser::Serialize,
     for<'de> Self: serde::de::Deserialize<'de>,
 {
-    /// Serializes Message into bytes.
+    /// Serializes the Messageable into bytes.
     fn to_bytes(&self) -> Result<Vec<u8>> {
         bincode::serialize(self).map_err(SerializeMsg)
     }
 
-    /// Deserialize Message from bytes.
+    /// Deserialize a Messageable from bytes.
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
         bincode::deserialize(bytes).map_err(DeserializeMsg)
     }
 
-    /// Tries to receive a message from the given stream.
-    async fn receive<S>(stream: &mut S) -> Result<Self>
+    /// Tries to read a Messageable from the async reader.
+    async fn receive<R>(reader: &mut R) -> Result<Self>
     where
-        S: AsyncReadExt + std::marker::Unpin + std::marker::Send,
+        R: AsyncReadExt + std::marker::Unpin + std::marker::Send,
     {
-        Self::from_bytes(&read_bytes(stream).await?)
+        Self::from_bytes(&read_bytes(reader).await?)
     }
 
-    /// Sends a message over the given stream.
-    async fn send<S>(&self, socket: &mut S) -> Result<()>
+    /// Writes the Messageable to the async writer.
+    async fn send<W>(&self, writer: &mut W) -> Result<()>
     where
-        S: AsyncWriteExt + std::marker::Unpin + std::marker::Send,
+        W: AsyncWriteExt + std::marker::Unpin + std::marker::Send,
     {
-        write_bytes(socket, &self.to_bytes()?).await
+        write_bytes(writer, &self.to_bytes()?).await
     }
 }
 
+/// Reads bytes from the async reader, use it along with [write_bytes].
 pub async fn read_bytes(stream: &mut (impl AsyncReadExt + std::marker::Unpin)) -> Result<Vec<u8>> {
     fn map_err(e: io::Error) -> Error {
         if e.kind() == ErrorKind::UnexpectedEof {
@@ -332,7 +353,8 @@ pub async fn read_bytes(stream: &mut (impl AsyncReadExt + std::marker::Unpin)) -
     Ok(bytes)
 }
 
-/// todo: tried to use future.and_then, but the writer was borrowed multiple times...
+/// Writes bytes to the async writer, use it alongside [read_bytes].
+// todo: tried to use future.and_then, but the writer was borrowed multiple times...
 pub async fn write_bytes(
     writer: &mut (impl AsyncWriteExt + std::marker::Unpin),
     bytes: &[u8],
