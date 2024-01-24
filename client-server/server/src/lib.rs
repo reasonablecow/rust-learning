@@ -1,266 +1,249 @@
 //! # Server Executable
 //!
-//! Listens at a specified address and broadcasts every received message to all other connected clients.
-//! See:
+//! Listens at a specified address, reads from and writes to connected clients.
+//!
+//! ## Database Setup
+//!
+//! You need to set up a database e.g.
+//! ```sh
+//! sudo docker run -p 5432:5432 --name pg -e POSTGRES_PASSWORD=pp -d postgres
+//! ```
+//! and set the environment variable `DATABASE_URL` accordingly, e.g.
+//! ```sh
+//! export DATABASE_URL=postgres://postgres:pp@localhost:5432/postgres
+//! ```
+//! details about the postgres url can be found [here](https://docs.rs/sqlx/latest/sqlx/postgres/struct.PgConnectOptions.html)
+//! for other databases see [ConnectOptions](https://docs.rs/sqlx/latest/sqlx/trait.ConnectOptions.html#implementors).
+//!
+//! ## TCP Address
+//!
+//! Host and port can be set via command line arguments, see:
 //! ```sh
 //! cargo run -- --help
 //! ```
 //!
-//! TODO: Messages received from one client should be broadcasted in the same order as received.
-use std::{
-    collections::HashMap,
-    fs,
-    net::{SocketAddr, TcpListener, TcpStream},
-    sync::{mpsc, Arc, Mutex},
-    thread,
-};
+//! TODO: Test client disconnection.
+
+use std::{env, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use chrono::{offset::Utc, SecondsFormat};
-use clap::Parser;
-use tracing::{error, info, warn};
+use dashmap::DashMap;
+use tokio::{
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpListener, TcpStream,
+    },
+    sync::mpsc::{self, Receiver, Sender},
+};
+use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
     filter::LevelFilter, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
     Layer,
 };
 
+mod db;
+
 use crate::Task::*;
-use cli_ser::{send_bytes, Error::DisconnectedStream, Message};
+use cli_ser::{cli, ser, Data, Error::DisconnectedStream, Messageable, User};
 
-pub const ADDRESS_DEFAULT: &str = "127.0.0.1:11111";
-
-/// Server executable, listens at specified address and broadcasts messages to all connected clients.
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-pub struct Args {
-    /// Server host
-    #[arg(long, default_value_t = String::from("127.0.0.1"))]
-    host: String,
-
-    /// Server port
-    #[arg(short, long, default_value_t = 11111)]
-    port: u32,
-}
-impl Args {
-    pub fn parse_to_address() -> String {
-        let args = Self::parse();
-        format!("{}:{}", args.host, args.port)
-    }
-}
+pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
+pub const PORT_DEFAULT: u16 = 11111;
 
 /// Tasks to be initially queued at the server and addressed later.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Task {
-    NewStream(TcpStream),
-    Check(SocketAddr),
-    SendErr(SocketAddr, cli_ser::ServerErr),
-    Broadcast(SocketAddr, Message),
-    StreamClose(SocketAddr),
+    Broadcast(SocketAddr, User, Data),
+    SendErr(SocketAddr, ser::Error),
 }
 
-type Streams = HashMap<SocketAddr, TcpStream>;
+/// Channels to tasks which writes to specified Address over TCP.
+type Senders = DashMap<SocketAddr, Sender<ser::Msg>>;
 
-/// The server's main function consists of a "listening" thread and the server's main loop.
+pub struct Server {
+    address: SocketAddr,
+    db: Arc<db::Database>,
+}
+impl Server {
+    /// Builds the server, especially database initialization, takes time.
+    pub async fn build(address: impl Into<SocketAddr>) -> anyhow::Result<Self> {
+        let url =
+            env::var("DATABASE_URL").context("Environment variable DATABASE_URL was not set!")?;
+        let address = address.into();
+        let db = Arc::new(db::Database::try_new(&url).await?);
+        Ok(Server { address, db })
+    }
+
+    /// Runs the server, connections should be accepted immediately.
+    pub async fn run(self) -> anyhow::Result<()> {
+        run(self).await
+    }
+}
+
+/// Asynchronously listen for clients, reads their messages and acts accordingly.
 ///
-/// The server is bound to a specified address (host and port).
-/// A separate "listening" thread is dedicated to capturing new clients.
+/// The server is bound to a specified address.
 /// In the main loop, the server processes tasks one at a time from its queue.
-/// Small tasks are resolved immediately, larger once are delegated to a thread pool.
-///
-/// TODO: Make thread pool size configurable by the caller.
-pub fn run(address: &str) -> anyhow::Result<()> {
-    let (task_taker, task_giver) = mpsc::channel();
-
-    let listener =
-        TcpListener::bind(address).with_context(|| "TCP listener creation should not fail.")?;
-    info!("Server is listening at {:?}", address);
-
-    let task_taker_clone = task_taker.clone();
-    let _stream_receiver = thread::spawn(move || {
-        for incoming in listener.incoming() {
-            match incoming {
-                Ok(stream) => {
-                    info!("incoming {:?}", stream);
-                    task_taker_clone
-                        .send(NewStream(stream))
-                        .unwrap_or_else(|e| error!("sending NewStream to tasks failed: {:?}", e))
-                }
-                Err(e) => error!("incoming stream error: {:?}", e),
-            }
-        }
-    });
-
-    let workers = ThreadPool::new(6);
-    let mut streams: Streams = HashMap::new();
-    for task in task_giver {
+/// The server is written as if it should run forever.
+async fn run(server: Server) -> anyhow::Result<()> {
+    let Server { address, db } = server;
+    let (task_producer, mut task_consumer) = mpsc::channel(1024);
+    let clients: Arc<Senders> = Arc::new(DashMap::new());
+    let listener = tokio::spawn(client_listener(address, task_producer, clients.clone(), db));
+    while let Some(task) = task_consumer.recv().await {
         match task {
-            NewStream(stream) => match stream.peer_addr() {
-                Ok(addr) => {
-                    streams.insert(addr, stream);
-                    task_taker.send(Check(addr)).unwrap_or_else(|e| {
-                        error!("sending Check(\"{}\") to tasks failed, error: {}", addr, e)
-                    })
+            Broadcast(addr_from, user_from, data) => {
+                info!("broadcasting \"{data}\" from {user_from} at {addr_from:?}");
+                let msg = ser::Msg::DataFrom {
+                    data: data.clone(),
+                    from: user_from.clone(),
+                };
+                for client in clients.iter() {
+                    let (addr_to, msg_channel) = (client.key(), client.value());
+                    if addr_from != *addr_to {
+                        match msg_channel.send(msg.clone()).await {
+                            Ok(_) => debug!("broadcasting to {addr_to:?}"),
+                            Err(e) => warn!("broadcasting to {addr_to:?} failed, error {e}"),
+                        }
+                    }
                 }
-                Err(e) => error!(
-                    "reading address of new stream {:?} failed, error {}",
-                    stream, e
-                ),
-            },
-            Check(addr) => {
-                check(addr, &streams, &workers, task_taker.clone());
             }
             SendErr(addr, err) => {
-                let fail_msg = format!("sending error message \"{err:?}\", to \"{addr:?}\" failed");
-                let fail_msg_clone = fail_msg.clone();
-
-                match streams.get(&addr).map(|s| s.try_clone()) {
-                    Some(Ok(mut stream)) => workers.execute(move || {
-                        Message::ServerErr(err).send(&mut stream).unwrap_or_else(|e| error!("{fail_msg_clone}, error: {e:?}"));
-                    }).unwrap_or_else(|e| error!("{fail_msg}, because sending a job to the thread pool failed, error {e}")),
-                    Some(Err(e)) => error!("{fail_msg}, because cloning stream for address {addr:?} failed, error {e:?}"),
-                    None => error!("{fail_msg}, because stream for address {addr:?} was not found")
+                if let Some(channel) = clients.get(&addr) {
+                    if let Err(e) = channel.send(ser::Msg::Error(err.clone()).clone()).await {
+                        warn!("Sending error msg {err:?} to {addr} failed! Error: {e:?}");
+                    }
                 }
-            }
-            Broadcast(addr_from, msg) => {
-                info!("broadcasting message from {:?}", addr_from);
-                broadcast(msg, addr_from, &streams, &workers, &task_taker)
-                    .with_context(|| "broadcasting message from {addr_from} failed")
-                    .unwrap_or_else(|e| error!("{}", e))
-            }
-            StreamClose(addr) => {
-                streams.remove(&addr).with_context(|| {
-                    "removing stream should never fail, contact the implementer! (address {addr})"
-                })?;
             }
         }
     }
-    Ok(())
+    listener.await?
 }
 
-/// Checks address for incoming messages, queues broadcast and another check.
-///
-/// TODO: Send ServerErr message when receiving fails.
-fn check(addr: SocketAddr, streams: &Streams, workers: &ThreadPool, tasks: mpsc::Sender<Task>) {
-    let Some(stream) = streams.get(&addr) else {
-        // The stream was probably removed after the Check creation.
-        warn!("stream for address {addr} wasn't found in order to check for incoming messages");
-        return;
-    };
-    let mut stream_clone = match stream.try_clone() {
-        Ok(sc) => sc,
-        Err(e) => return error!("cloning stream to check incoming message failed {e}"),
-    };
-    workers
-        .execute(move || {
-            let check_again = || {
-                tasks
-                    .send(Check(addr))
-                    .unwrap_or_else(|e| error!("sending Check({addr}) to tasks failed, error {e}"))
-            };
-            match Message::receive(&mut stream_clone) {
-                Ok(Some(msg)) => {
-                    tasks.send(Broadcast(addr, msg)).unwrap_or_else(|e| {
-                        error!("sending Broadcast from \"{addr}\" to tasks failed, error {e:?}")
-                    });
-                    check_again();
-                }
-                Ok(None) => check_again(),
-                Err(cli_ser::Error::DisconnectedStream(_)) => {
-                    info!("disconnected {}", addr);
-                    tasks.send(StreamClose(addr)).unwrap_or_else(|e| {
-                        error!("sending StreamClose({addr}) to tasks failed, error {e}")
-                    });
-                }
-                Err(e) => {
-                    error!("receiving message from stream {addr} failed, error {e}");
-                    check_again();
-                }
-            }
-        })
-        .unwrap_or_else(|e| error!("sending a job to the thread pool failed, error {e}"))
-}
-
-/// Sends message to all streams except the `addr_from` using workers ThreadPool
-fn broadcast(
-    msg: Message,
-    addr_from: SocketAddr,
-    streams: &Streams,
-    workers: &ThreadPool,
-    tasks: &mpsc::Sender<Task>,
+/// Listens for connections, spawns task to handle each client.
+async fn client_listener(
+    address: SocketAddr,
+    tasks: Sender<Task>,
+    clients: Arc<Senders>,
+    db: Arc<db::Database>,
 ) -> anyhow::Result<()> {
-    let bytes = msg
-        .serialize()
-        .with_context(|| "message serialization failed")?;
-    for (&addr_to, stream) in streams.iter() {
-        if addr_from != addr_to {
-            let mut stream_clone = stream
-                .try_clone()
-                .with_context(|| "cloning stream failed")?;
-            let bytes_clone = bytes.clone();
-            let tasks_clone = tasks.clone();
-
-            let err_msg = |addr| format!("sending message to client \"{addr:?}\" failed");
-            workers.execute(move || match send_bytes(&mut stream_clone, &bytes_clone) {
-                Ok(()) => {}
-                Err(DisconnectedStream(_)) => {}
-                other => {
-                    let err = cli_ser::ServerErr::Sending(format!("{}, because {other:?}", err_msg(addr_to)));
-                    tasks_clone.send(Task::SendErr(addr_from, err.clone()))
-                        .unwrap_or_else(|e| error!("sending SendErr({addr_from}, {err:?}) to tasks failed, error {e}"))
-                    }
-            }).unwrap_or_else(|e| {
-                let err = cli_ser::ServerErr::Sending(format!("{}, because the thread pool execution failed, error {e:?}", err_msg(addr_to)));
-                tasks.send(Task::SendErr(addr_from, err.clone()))
-                    .unwrap_or_else(|e| error!("sending SendErr({addr_from}, {err:?}) to tasks failed, error {e}"))
-            });
+    let listener = TcpListener::bind(address)
+        .await
+        .with_context(|| format!("Listening at {address:?} failed."))?;
+    info!("Server is listening at {address:?}");
+    loop {
+        match listener.accept().await {
+            Ok((mut socket, addr)) => {
+                info!("incoming {addr:?}");
+                {
+                    let (tasks, clients, db) = (tasks.clone(), clients.clone(), db.clone());
+                    tokio::spawn(async move {
+                        match authenticate(&mut socket, db.clone()).await {
+                            Ok(user) => {
+                                if let Err(e) =
+                                    manage_client(addr, user, socket, clients, db, tasks).await
+                                {
+                                    error!("Managing client at {addr} failed! Error {e:#}");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Authenticating the client at {addr} failed! Error {e:#}")
+                            }
+                        }
+                    });
+                }
+            }
+            Err(e) => error!("incoming stream error: {e:?}"),
         }
     }
+}
+
+/// Adds the client to `clients`, reads from and writes to it, then removes it from `clients`.
+async fn manage_client(
+    addr: SocketAddr,
+    user: User,
+    socket: TcpStream,
+    clients: Arc<Senders>,
+    db: Arc<db::Database>,
+    tasks: Sender<Task>,
+) -> anyhow::Result<()> {
+    let (reader, writer) = socket.into_split();
+
+    let (msg_producer, msg_consumer) = mpsc::channel(128);
+    let writer_task = tokio::spawn(write_each_msg(msg_consumer, writer));
+
+    clients.insert(addr, msg_producer);
+    let reader_res = read_in_loop(addr, user, reader, db, tasks.clone()).await;
+    clients
+        .remove(&addr)
+        .with_context(|| "Removing disconnected client \"{addr}\" from clients failed!")?;
+
+    reader_res.with_context(|| "Reading messages at {addr} failed!")?;
+    writer_task
+        .await
+        .context("Writer task should never panic, contact the implementer!")?;
     Ok(())
 }
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
-/// Structure for executing jobs in parallel on fixed number of threads.
-///
-/// Inspired by: <https://doc.rust-lang.org/book/ch20-02-multithreaded.html>
-///
-/// Warning: The thread pool can not recover from a poisoned mutex on the job channel.
-struct ThreadPool {
-    channel: mpsc::Sender<Job>,
-    _threads: Vec<thread::JoinHandle<()>>,
+async fn authenticate(socket: &mut TcpStream, db: Arc<db::Database>) -> anyhow::Result<User> {
+    let user = loop {
+        let err = match cli::Msg::receive(socket).await? {
+            cli::Msg::Auth(cli::Auth::LogIn(creds)) => match db.log_in(creds.clone()).await {
+                Ok(()) => break creds.user,
+                Err(db::Error::UserDoesNotExist(_)) => ser::Error::WrongUser,
+                Err(db::Error::WrongPassword(_)) => ser::Error::WrongPassword,
+                Err(e) => return Err(e.into()),
+            },
+            cli::Msg::Auth(cli::Auth::SignUp(creds)) => match db.sign_up(creds.clone()).await {
+                Ok(()) => break creds.user,
+                Err(db::Error::UsernameTaken(_)) => ser::Error::UsernameTaken,
+                Err(e) => return Err(e.into()),
+            },
+            m => ser::Error::NotAuthenticated(m),
+        };
+        ser::Msg::Error(err).send(socket).await?;
+    };
+    ser::Msg::Authenticated
+        .send(socket)
+        .await
+        .with_context(|| "Sending authentication confirmation failed!")?;
+    Ok(user)
 }
-impl ThreadPool {
-    fn new(thread_cnt: usize) -> ThreadPool {
-        let (channel, job_recv) = mpsc::channel::<Job>();
-        let job_recv = Arc::new(Mutex::new(job_recv));
 
-        let _threads = (0..thread_cnt)
-            .map(|_| {
-                let job_recv_clone = Arc::clone(&job_recv);
-                thread::spawn(move || loop {
-                    let job_result = job_recv_clone
-                        .lock()
-                        .expect("acquiring a mutex to receive a job failed")
-                        .recv();
-                    match job_result {
-                        Ok(job) => job(),
-                        Err(e) => error!("receiving a job from job queue failed, error {e}"),
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        ThreadPool { channel, _threads }
+/// Receives messages from `reader` until disconnection, sends tasks to the `tasks` queue.
+async fn read_in_loop(
+    addr: SocketAddr,
+    user: User,
+    mut reader: OwnedReadHalf,
+    db: Arc<db::Database>,
+    tasks: Sender<Task>,
+) -> anyhow::Result<()> {
+    loop {
+        let task = match cli::Msg::receive(&mut reader).await {
+            Ok(cli::Msg::ToAll(data)) => {
+                if let Err(e) = db.record_msg_to_all(user.clone(), data.clone()).await {
+                    error!("{e}"); // TODO
+                }
+                Broadcast(addr, user.clone(), data)
+            }
+            Ok(cli::Msg::Auth { .. }) => SendErr(addr, ser::Error::AlreadyAuthenticated),
+            Err(DisconnectedStream(_)) => break Ok(()),
+            Err(e) => SendErr(addr, ser::Error::ReceiveMsg(e.to_string())),
+        };
+        tasks
+            .send(task)
+            .await
+            .with_context(|| "Emergency! Task queue stopped working!")?;
     }
+}
 
-    /// TODO: Can not use anyhow, because Box<dyn FnOnce() + Send + 'static>
-    /// can not be shared between threads.
-    pub fn execute<F>(&self, f: F) -> std::result::Result<(), Box<dyn std::error::Error>>
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.channel.send(Box::new(f))?;
-        Ok(())
+/// Writes every received message from `messages` into `writer`.
+async fn write_each_msg(mut messages: Receiver<ser::Msg>, mut writer: OwnedWriteHalf) {
+    while let Some(msg) = messages.recv().await {
+        if let Err(e) = msg.send(&mut writer).await {
+            error!("Writing the message {msg} to {writer:?} failed! Error {e}")
+        }
     }
 }
 
@@ -270,7 +253,7 @@ impl ThreadPool {
 pub fn init_logging_stdout_and_file() -> anyhow::Result<WorkerGuard> {
     let term_layer = tracing_subscriber::fmt::layer().with_filter(LevelFilter::INFO);
 
-    let file = fs::File::create(format!(
+    let file = std::fs::File::create(format!(
         "{}.log",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     ))
@@ -292,10 +275,11 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[test]
-    fn test_run_1_sec() {
-        let server_thread = thread::spawn(|| run(ADDRESS_DEFAULT));
-        thread::sleep(Duration::from_secs(1));
+    #[tokio::test]
+    async fn test_run_1_sec() {
+        let server = Server::build((HOST_DEFAULT, PORT_DEFAULT)).await.unwrap();
+        let server_thread = tokio::spawn(server.run());
+        std::thread::sleep(Duration::from_secs(1));
         assert!(!server_thread.is_finished());
     }
 }

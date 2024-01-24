@@ -1,228 +1,316 @@
 //! # Client Executable
 //!
-//! See:
+//! Connects to server at specified address.
+//!
+//! ## Special Commands
+//!
+//! These phrases at the beginning of the line has a special meaning:
+//!
+//! * `.signup USER PASSWORD` - sends request to create a new user.
+//! * `.login USER PASSWORD` - sends a request to log in with the user.
+//! * `.file PATH` - sends given file.
+//! * `.image PATH` - sends given image if encoding succeeds.
+//!
+//! Anything else is transmitted as a **text** message.
+//!
+//! ## Command-line Options
+//!
+//! To see configurable options, run:
 //! ```sh
 //! cargo run -- --help
 //! ```
-use std::{fs, io, net::TcpStream, path::Path, sync::mpsc, thread, time::Duration};
+//!
+//! TODO: Add ".help" or similar to see how to make messages right from the client.
+use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{anyhow, Context};
-use clap::Parser;
 use regex::Regex;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    select,
+    sync::{mpsc, oneshot},
+};
 
-use cli_ser::Message;
+use cli_ser::{cli, ser, Data, File, Image, Messageable};
 
-/* // TODO: lazy statics for paths
-use once_cell::sync::Lazy;
-static FILES_DIR: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("files"));
-*/
-const HOST_DEFAULT: &str = "127.0.0.1"; // TODO - representation other than str
-const PORT_DEFAULT: u16 = 11111;
+pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
+pub const PORT_DEFAULT: u16 = 11111;
 
-/// Client executable, interactively sends messages to the specified server.
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Server host
-    #[arg(long, default_value_t = String::from(HOST_DEFAULT))]
-    host: String,
-
-    /// Server port
-    #[arg(short, long, default_value_t = PORT_DEFAULT)]
-    port: u16,
-
-    /// Save all images as PNG.
-    #[arg(short, long, default_value_t = false)]
-    save_png: bool,
+// Idea: maybe implement std Default for this...
+#[derive(Clone)]
+pub struct Client {
+    pub file_dir: PathBuf,
+    pub img_dir: PathBuf,
+    pub addr: SocketAddr,
+    pub save_png: bool,
 }
+impl Client {
+    /// Sends messages (read form the terminal) to the server, and prints received ones.
+    ///
+    /// Spawns stdin reader thread, tcp sender and tcp receiver tasks.
+    pub async fn run(self) -> anyhow::Result<()> {
+        let (reader, writer) = TcpStream::connect(self.addr)
+            .await
+            .with_context(|| {
+                "Connection to the server failed, please make sure the server is running."
+            })?
+            .into_split();
+        // Channel to indicate to stop receiving for messages.
+        let (quit_sender, quit_receiver) = oneshot::channel();
+        // Channel to pass input read in blocking thread to the async handle task.
+        let (input_producer, input_consumer) = mpsc::channel(128);
 
-/// Client's main function.
-///
-/// The main thread in a loop executes commands given by the user.
-/// Another thread is spawned in the background to receive messages from the server.
-pub fn run() -> anyhow::Result<()> {
-    let files_dir = Path::new("files");
-    let images_dir = Path::new("images");
+        let stdin_reader = std::thread::spawn(move || Self::read_stdin(input_producer));
+        let msg_receiver = tokio::spawn(self.receive_in_loop(reader, quit_receiver));
+        let msg_sender = tokio::spawn(Self::handle_input(input_consumer, writer, quit_sender));
 
-    let args = Args::parse();
+        // Awaiting the msg_receiver first is important for crash to show up when it happens.
+        msg_receiver
+            .await?
+            .with_context(|| "Receiver went through an unrecoverable error")?;
+        msg_sender
+            .await?
+            .with_context(|| "Message sender crashed.")?;
 
-    fs::create_dir_all(files_dir).with_context(|| "Directory for files couldn't be created")?;
-    fs::create_dir_all(images_dir).with_context(|| "Directory for images couldn't be created")?;
+        // thread .join()'s Err variant does not implement Error trait -> .expect.
+        stdin_reader
+            .join()
+            .expect("stdin_reader thread should never panic")
+            .with_context(|| "Reader of standard input crashed.")?;
+        Ok(())
+    }
 
-    let mut stream =
-        TcpStream::connect(format!("{}:{}", args.host, args.port)).with_context(|| {
-            "Connection to the server failed, please make sure the server is running."
-        })?;
-
-    let mut stream_clone = stream
-        .try_clone()
-        .with_context(|| "Cloning of TcpStream for receiving messages failed")?;
-
-    // Channel to indicate to stop waiting for messages.
-    let (send_quit, recv_quit) = mpsc::channel();
-
-    // Reads messages from the server in the background.
-    let receiver = thread::spawn(move || -> anyhow::Result<()> {
-        loop {
-            if let Some(msg) = Message::receive(&mut stream_clone)
-                .with_context(|| "reading bytes should never fail")?
-            {
-                match msg {
-                    Message::Text(text) => println!("{}", text),
-                    Message::File(f) => {
-                        println!("Received {:?}", f.name());
-                        f.save(files_dir).unwrap_or_else(|e| {
-                            eprintln!("...saving the file \"{:?}\" failed! Err: {:?}", f.name(), e)
-                        });
-                    }
-                    Message::Image(image) => {
-                        println!("Received image...");
-                        match if args.save_png {
-                            image.save_as_png(images_dir)
-                        } else {
-                            image.save(images_dir)
-                        } {
-                            Ok(path) => println!("...image was saved to {:?}", path),
-                            Err(e) => eprintln!("...saving the image failed! Err: {:?}", e),
-                        }
-                    }
-                    Message::ServerErr(err) => eprintln!("received error: \"{err:?}\""),
-                }
-            } else if recv_quit.try_recv().is_ok() {
-                break Ok(());
-            }
-        }
-    });
-
-    // Parses and executes commands given by the user.
-    loop {
-        if receiver.is_finished() {
-            break;
-        }
-        println!("Please type the command:");
-        let msg = match Command::from(
-            &*read_line_from_stdin().with_context(|| "reading your command failed")?,
-        ) {
-            Command::Quit => {
-                println!("Goodbye!");
-                // Time for messages which were sent but were not receivable yet.
-                thread::sleep(Duration::from_secs(5));
-                send_quit
-                    .send(())
-                    .with_context(|| "Sending a quit signal to the message receiver failed")?;
+    /// Reads lines from standard input and sends them over mpsc channel until a Quit is parsed.
+    ///
+    /// The [tokio documentation](https://docs.rs/tokio_wasi/latest/tokio/io/fn.stdin.html)
+    /// says you should spawn a separate thread.
+    ///
+    /// I had a problem to see anywhere implemented that way, the
+    /// [Google Comprehensive Rust - Chat Application](https://google.github.io/comprehensive-rust/exercises/concurrency/chat-app.html)
+    /// uses BufReader, however it requires at least one "enter" stroke for tests.
+    ///
+    /// ["For technical reasons, stdin is implemented by using an ordinary blocking read on a separate thread,
+    /// and it is impossible to cancel that read.
+    /// This can make shutdown of the runtime hang until the user presses enter."](https://docs.rs/tokio/latest/tokio/io/struct.Stdin.html)
+    fn read_stdin(sender: mpsc::Sender<String>) -> anyhow::Result<()> {
+        for line in std::io::stdin().lines() {
+            let line = line.with_context(|| "Reading a line from stdin failed.")?;
+            if line.parse::<Quit>().is_ok() {
                 break;
             }
-            cmd => Message::try_from(cmd)
-                .with_context(|| "Bug in a client code, contact the implementer")?,
+            sender
+                .blocking_send(line)
+                .with_context(|| "Sending a line over the channel failed.")?;
+        }
+        Ok(())
+    }
+
+    /// Receives and processes messages from the server until quit message comes.
+    async fn receive_in_loop<S>(
+        self,
+        mut reader: S,
+        mut quit: oneshot::Receiver<()>,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncReadExt + std::marker::Unpin + std::marker::Send,
+    {
+        loop {
+            select!(
+                msg = ser::Msg::receive(&mut reader) => self.process_msg(msg.with_context(|| "reading a message from server failed")?).await,
+                _ = &mut quit => break Ok(()),
+            )
+        }
+    }
+
+    /// Processes given message, either prints, or writes to a file.
+    async fn process_msg(&self, msg: ser::Msg) {
+        match msg {
+            ser::Msg::DataFrom {
+                data: Data::Text(text),
+                from,
+            } => println!("{from}: {text}"),
+            ser::Msg::DataFrom {
+                data: Data::File(f),
+                from,
+            } => {
+                println!("Received {:?} from {from}", f.name());
+                f.save(&self.file_dir).await.unwrap_or_else(|e| {
+                    eprintln!("...saving the file \"{:?}\" failed! Err: {:?}", f.name(), e)
+                });
+            }
+            ser::Msg::DataFrom {
+                data: Data::Image(image),
+                from,
+            } => {
+                println!("Received image from {from}...");
+                match if self.save_png {
+                    image.save_as_png(&self.img_dir).await
+                } else {
+                    image.save(&self.img_dir).await
+                } {
+                    Ok(path) => println!("...image was saved to {:?}", path),
+                    Err(e) => eprintln!("...saving the image failed! Err: {:?}", e),
+                }
+            }
+            ser::Msg::Authenticated => println!("Welcome!"),
+            ser::Msg::Error(ser::Error::WrongPassword) => {
+                eprintln!("Given password is not correct")
+            }
+            ser::Msg::Error(ser::Error::WrongUser) => {
+                eprintln!("The user does not exist, you can create it with a .signup")
+            }
+            ser::Msg::Error(ser::Error::UsernameTaken) => {
+                eprintln!("Unfortunately this username is already taken, choose another one.")
+            }
+            ser::Msg::Error(ser::Error::NotAuthenticated(msg)) => {
+                eprintln!("You need to .login or .signup before sending a message (parsed message: {msg})")
+            }
+            ser::Msg::Error(ser::Error::AlreadyAuthenticated) => {
+                eprintln!("You are currently logged in, if you want to log in as another user first log out.")
+            }
+            ser::Msg::Error(err) => eprintln!("Error: {err:?}"),
         };
-        msg.send(&mut stream)
-            .with_context(|| "sending your message to the server failed")?;
     }
 
-    // Wait for the receiver to finish its job.
-    receiver
-        .join()
-        // thread::Error doesn't implement Sync -> can not be used with anyhow
-        .expect("Message receiver crashed even though it never should, contact the implementer!")
-        .with_context(|| "Receiver went through an unrecoverable error")?;
-    Ok(())
+    /// Parses incoming lines into messages and writes them to the writer.
+    ///
+    /// When lines are closed, sends a quit signal to the one-shot channel.
+    async fn handle_input<S>(
+        mut lines: mpsc::Receiver<String>,
+        mut writer: S,
+        quit: oneshot::Sender<()>,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncWriteExt + std::marker::Unpin + std::marker::Send,
+    {
+        while let Some(line) = lines.recv().await {
+            match parse_msg(&line).await {
+                Ok(msg) => msg
+                    .send(&mut writer)
+                    .await
+                    .with_context(|| "sending your message to the server failed")?,
+                Err(e) => eprintln!("Couldn't create your message (error: {e:?})"),
+            };
+        }
+        quit.send(())
+            .map_err(|_| anyhow!("Sending a quit signal to the message receiver failed"))?;
+        Ok(())
+    }
 }
 
-/// Reads line from standard input, strips ending newline if present.
-fn read_line_from_stdin() -> anyhow::Result<String> {
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .with_context(|| "reading a line from standard input failed")?;
-    Ok(line.strip_suffix('\n').map(str::to_string).unwrap_or(line))
-}
+#[derive(Debug, PartialEq, Eq)]
+struct NotQuit;
+#[derive(Debug, PartialEq, Eq)]
+struct Quit;
+impl FromStr for Quit {
+    type Err = NotQuit;
 
-/// Commands useful for the client user.
-#[derive(Debug, PartialEq)]
-pub enum Command {
-    Quit,
-    File(String),
-    Image(String),
-    Other(String),
-}
-/// Converts the first line of the borrowed str to Command, rest is ignored.
-impl From<&str> for Command {
-    fn from(value: &str) -> Self {
-        let err_msg = "unexpected regex error, contact the crate implementer";
-        let reg_quit = Regex::new(r"^\s*\.quit\s*$").expect(err_msg);
-        let reg_file = Regex::new(r"^\s*\.file\s+(?<file>\S+.*)\s*$").expect(err_msg);
-        let reg_image = Regex::new(r"^\s*\.image\s+(?<image>\S+.*)\s*$").expect(err_msg);
-
-        if reg_quit.is_match(value) {
-            Command::Quit
-        } else if let Some((_, [file])) = reg_file.captures(value).map(|caps| caps.extract()) {
-            Command::File(file.to_string())
-        } else if let Some((_, [image])) = reg_image.captures(value).map(|caps| caps.extract()) {
-            Command::Image(image.to_string())
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if Regex::new(r"^\s*\.quit\s*$").unwrap().is_match(s) {
+            Ok(Quit)
         } else {
-            Command::Other(value.to_string())
-        }
-    }
-}
-impl TryFrom<Command> for Message {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Command) -> Result<Self, <cli_ser::Message as TryFrom<Command>>::Error> {
-        match value {
-            Command::Quit => Err(anyhow!(
-                "A Massage can not be constructed from a Quit command!"
-            )),
-            Command::Other(s) => Ok(Message::Text(s)),
-            Command::File(path) => Ok(Message::file_from_path(path)?),
-            Command::Image(path) => Ok(Message::img_from_path(path)?),
+            Err(NotQuit)
         }
     }
 }
 
+/// Parses message from string, files and images are read into memory.
+///
+/// TODO: Document special phrases and its usage.
+/// TODO: Handle wrong usage such as .login without less than two arguments.
+async fn parse_msg(line: &str) -> anyhow::Result<cli::Msg> {
+    let err_msg = "unexpected regex error, contact the crate implementer";
+    let reg_file = Regex::new(r"^\s*\.file\s+(?<file>\S+)\s*.*$").expect(err_msg);
+    let reg_image = Regex::new(r"^\s*\.image\s+(?<image>\S+)\s*.*$").expect(err_msg);
+    let reg_log_in = Regex::new(r"^\s*\.login\s+(?<name>\S+)\s+(?<pswd>\S+)\s*.*$").expect(err_msg);
+    let reg_sign_up =
+        Regex::new(r"^\s*\.signup\s+(?<name>\S+)\s+(?<pswd>\S+)\s*.*$").expect(err_msg);
+
+    let msg = if let Some((_, [file])) = reg_file.captures(line).map(|caps| caps.extract()) {
+        cli::Msg::ToAll(File::from_path(file).await?.into())
+    } else if let Some((_, [image])) = reg_image.captures(line).map(|caps| caps.extract()) {
+        cli::Msg::ToAll(Image::from_path(image).await?.into())
+    } else if let Some((_, [name, pswd])) = reg_log_in.captures(line).map(|caps| caps.extract()) {
+        cli::Msg::Auth(cli::Auth::LogIn(cli::Credentials {
+            user: name.to_string().into(),
+            password: pswd.to_string(),
+        }))
+    } else if let Some((_, [name, pswd])) = reg_sign_up.captures(line).map(|caps| caps.extract()) {
+        cli::Msg::Auth(cli::Auth::SignUp(cli::Credentials {
+            user: name.to_string().into(),
+            password: pswd.to_string(),
+        }))
+    } else {
+        cli::Msg::ToAll(Data::Text(line.to_string()))
+    };
+    Ok(msg)
+}
+
+/// TODO: more tests for the parse_msg.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::time::Duration;
 
-    #[test]
-    fn command_from_str_quit() {
-        assert_eq!(Command::Quit, Command::from(".quit"));
-        assert_eq!(Command::Quit, Command::from("      .quit      "));
+    #[tokio::test]
+    async fn parse_quit() {
+        assert_eq!(Quit, ".quit".parse::<Quit>().unwrap());
+        assert_eq!(Quit, "      .quit      ".parse::<Quit>().unwrap());
+        assert_eq!(NotQuit, "      text      ".parse::<Quit>().unwrap_err());
     }
 
-    #[test]
-    fn command_from_str_file() {
-        let f = "a.txt";
+    #[tokio::test]
+    async fn parse_msg_file() {
+        let path = "Cargo.toml";
         assert_eq!(
-            Command::File(String::from(f)),
-            Command::from(&*format!(".file {}", f))
+            cli::Msg::ToAll(File::from_path(path).await.unwrap().into()),
+            parse_msg(&*format!(".file {path}")).await.unwrap()
         );
     }
 
-    #[test]
-    fn command_from_str_image() {
-        let i = "i.png";
+    #[tokio::test]
+    async fn parse_msg_img() {
+        let path = "../example-images/rustacean-orig-noshadow.png";
         assert_eq!(
-            Command::Image(String::from(i)),
-            Command::from(&*format!(".image {}", i))
+            cli::Msg::ToAll(Image::from_path(path).await.unwrap().into()),
+            parse_msg(&*format!(".image {path}")).await.unwrap()
         );
     }
 
-    #[test]
-    fn command_from_str_other() {
-        for s in [". quit", ".quit      s", "a   .quit "] {
-            assert_eq!(Command::Other(String::from(s)), Command::from(s));
+    #[tokio::test]
+    async fn parse_msg_text() {
+        for s in ["some text"] {
+            assert_eq!(
+                cli::Msg::ToAll(Data::Text(s.to_string())),
+                parse_msg(s).await.unwrap()
+            );
         }
     }
 
-    #[test]
-    fn test_run() {
-        let listener = std::net::TcpListener::bind(format!("{}:{}", HOST_DEFAULT, PORT_DEFAULT))
+    #[tokio::test]
+    async fn test_run() {
+        let addr = SocketAddr::from((HOST_DEFAULT, PORT_DEFAULT));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
             .expect("TCP listener creation should not fail.");
-        let server_thread = thread::spawn(move || {
-            std::iter::from_fn(|| listener.incoming().next()).collect::<Vec<_>>()
+        let server_thread = tokio::spawn(async move {
+            let mut v: Vec<TcpStream> = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.expect("Accepting client failed!");
+                v.push(socket);
+            }
         });
-        let client_thread = thread::spawn(run);
-        thread::sleep(Duration::from_secs(1));
+        let client_thread = tokio::spawn(
+            Client {
+                img_dir: PathBuf::from("imgs"),
+                file_dir: PathBuf::from("fls"),
+                addr,
+                save_png: true,
+            }
+            .run(),
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!server_thread.is_finished());
         assert!(!client_thread.is_finished());
     }
