@@ -7,7 +7,7 @@ use std::{
 use anyhow::Context;
 use clap::Parser;
 
-use client::{Client, HOST_DEFAULT, PORT_DEFAULT};
+use client::{Config, HOST_DEFAULT, PORT_DEFAULT};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -21,13 +21,12 @@ async fn main() -> anyhow::Result<()> {
     let host: IpAddr = args.host.parse()?;
     let addr = SocketAddr::from((host, args.port));
 
-    Client {
+    client::run(Config {
         file_dir,
         img_dir,
         addr,
         save_png: args.save_png,
-    }
-    .run()
+    })
     .await
 }
 

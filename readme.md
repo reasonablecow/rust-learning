@@ -4,7 +4,7 @@ Welcome! Within this repository, you'll find my solutions for homework assignmen
 
 ## [first](./first)
 
-Hello world in Rust - my first ever project.
+Hello world - my first Rust project.
 
 ## [Text-Tool](./text-tool)
 
@@ -12,4 +12,4 @@ Command-line application for transforming text.
 
 ## [Client-Server](./client-server)
 
-Implementation of a simple tcp client, server, and common utilities.
+Implementation of a simple TCP client, server, and a common ground for communication.

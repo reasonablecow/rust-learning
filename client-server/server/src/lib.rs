@@ -21,8 +21,8 @@
 //! ```sh
 //! cargo run -- --help
 //! ```
-//!
-//! TODO: Test client disconnection.
+//! otherwise default [host][HOST_DEFAULT] and [port][PORT_DEFAULT] are used.
+// TODO: Test client disconnection.
 
 use std::{env, net::SocketAddr, sync::Arc};
 
@@ -48,7 +48,9 @@ mod db;
 use crate::Task::*;
 use cli_ser::{cli, ser, Data, Error::DisconnectedStream, Messageable, User};
 
+/// Default server host, used when not specified.
 pub const HOST_DEFAULT: [u8; 4] = [127, 0, 0, 1];
+/// Default server port, used when not specified.
 pub const PORT_DEFAULT: u16 = 11111;
 
 /// Tasks to be initially queued at the server and addressed later.
@@ -61,6 +63,7 @@ enum Task {
 /// Channels to tasks which writes to specified Address over TCP.
 type Senders = DashMap<SocketAddr, Sender<ser::Msg>>;
 
+/// Server structure, first needs to be [built][Self::build] and then can be [run][Self::run].
 pub struct Server {
     address: SocketAddr,
     db: Arc<db::Database>,
@@ -68,10 +71,13 @@ pub struct Server {
 impl Server {
     /// Builds the server, especially database initialization, takes time.
     pub async fn build(address: impl Into<SocketAddr>) -> anyhow::Result<Self> {
-        let url =
-            env::var("DATABASE_URL").context("Environment variable DATABASE_URL was not set!")?;
+        let url = env::var("DATABASE_URL")
+            .context("Environment variable DATABASE_URL was not set!")
+            .context("Database specification failed, see server's documentation!")?;
         let address = address.into();
-        let db = Arc::new(db::Database::try_new(&url).await?);
+        let db = Arc::new(db::Database::try_new(&url).await.context(
+            "Database connection and initialization failed, see server's documentation!",
+        )?);
         Ok(Server { address, db })
     }
 
@@ -272,14 +278,5 @@ pub fn init_logging_stdout_and_file() -> anyhow::Result<WorkerGuard> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn test_run_1_sec() {
-        let server = Server::build((HOST_DEFAULT, PORT_DEFAULT)).await.unwrap();
-        let server_thread = tokio::spawn(server.run());
-        std::thread::sleep(Duration::from_secs(1));
-        assert!(!server_thread.is_finished());
-    }
+    // Since most operations are almost exclusively IO, there are currently only integration tests, you can find them in the tests directory.
 }
